@@ -1,0 +1,34 @@
+/* style4.css: map tokens, light, motion, highlight */
+.mapw .mo{font-family:var(--f-mono)}.mapw .ui{font-family:var(--f-ui)}
+.emb{flex:none;overflow:visible}
+/* Halftone Plate: flat screen print, running = dot screen printing in 4 diagonal waves */
+.wv{animation:wv 1.8s ease-in-out infinite}.w1{animation-delay:.22s}.w2{animation-delay:.44s}.w3{animation-delay:.66s}
+@keyframes wv{0%,100%{opacity:1}50%{opacity:.35}}
+.march{fill:none;stroke-width:2.6;stroke-linecap:round;stroke-dasharray:.01 4.6;animation:march .9s linear infinite;pointer-events:none}
+@keyframes march{to{stroke-dashoffset:-4.61}}
+.ping{fill:none;stroke-width:1.5;opacity:0;transform-box:fill-box;transform-origin:center}
+.nd.lit .ping{animation:ping 700ms var(--ease) 1}
+@keyframes ping{from{opacity:.6;transform:scale(1)}to{opacity:0;transform:scale(1.9)}}
+.ret,.bz{display:none}
+.nd:is(.sel,:focus-visible) .ret,.nd:is(.sel,.pick) .bz{display:inline}
+.mapw .nd{transition:transform 420ms var(--ease),opacity 300ms var(--ease);transform-box:fill-box;transform-origin:center}
+.mapw .nd.fold{opacity:.35;transform:scale(.8)}
+.mapw .cab{transition:stroke-opacity var(--m-hover) var(--ease),stroke-width var(--m-hover) var(--ease),opacity 180ms var(--ease)}
+.mapw .cab:is(.on,.wit){stroke-opacity:1}
+.mapw .cab:not(.seat):is(.on,.wit){stroke-width:2.5px}
+.mapw :is(.cab,.march).fold{opacity:.35}
+.mapw .cab.draw{transition:stroke-dashoffset 480ms var(--ease) 80ms}
+.mapw :is(.bd,.pod,.spk,.sec,.seal,.sr,text){transition:opacity 180ms var(--ease)}
+.mapw svg.hl :is(.nd,.cab,.bd,.pod,.spk,.sec,text):not(.on){opacity:.38}
+.mapw :is(.bd,.pod,.spk,.seal,.sr){cursor:pointer;outline:none}
+.mapw :is(.bd,.pod,.spk,.seal,.sr):focus-visible{outline:1.5px dashed var(--ink);outline-offset:3px}
+.bd .bb{transition:r var(--m-hover) var(--ease)}
+.bd:is(:hover,.on,:focus-visible) .bb{r:5.5px}
+.pod rect{transition:stroke var(--m-hover) var(--ease)}
+.pod:is(:hover,:focus-visible) rect{stroke:var(--mist)}
+.mapw :is(.pod,.pst){transition:opacity 300ms var(--ease)}
+.mapw svg.unf :is(.pod,.pst){opacity:0;pointer-events:none}
+.mapw svg.podin .pod{animation:podin 220ms var(--ease)}
+@keyframes podin{from{opacity:0}}
+.sr:is(:hover,:focus-visible) rect{fill:rgba(255,255,255,.04)}
+.key+.key{padding-top:0}

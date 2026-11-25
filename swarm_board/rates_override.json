@@ -1,0 +1,15 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "description": "Verified model pricing overrides layered above usage-model-rates.json and litellm-rates.json. Add entries only when backed by an official source_url and verified_at date.",
+    "entry_schema": {
+      "input_cost_per_token": "USD per uncached input token (float)",
+      "output_cost_per_token": "USD per output token (float)",
+      "cache_read_input_token_cost": "USD per cached input read token (float, optional)",
+      "cache_creation_input_token_cost": "USD per cache creation token (float, optional)",
+      "source_url": "Official pricing URL (string)",
+      "verified_at": "Verification date YYYY-MM-DD (string)"
+    }
+  },
+  "models": {}
+}
