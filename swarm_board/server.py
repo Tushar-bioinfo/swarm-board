@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -1586,6 +1587,69 @@ def _probe_health(
                 pass
 
 
+# Persistent user unit (~/.config/systemd/user/swarm-board.service) that runs the server outside any
+# agent's systemd scope. Starting a unit that is already running does nothing, so launches cannot
+# duplicate. The unit takes its host, idle time, and state directory from config.json and the
+# defaults, so only launches without per-call overrides use it.
+SYSTEMD_UNIT = "swarm-board.service"
+_SYSTEMCTL_TIMEOUT_S = 8.0
+# The hook holds ensure.lock while it starts the unit, so it queues the start job and waits only briefly.
+_HOOK_SYSTEMCTL_TIMEOUT_S = 2.0
+# Any of these set in the caller's environment (even empty) keeps the direct child-process path,
+# because the unit cannot see them. The server treats an empty SWARM_BOARD_CONFIG as "no config".
+_UNIT_ENV_OVERRIDES = (
+    "SWARM_BOARD_HOST",
+    "SWARM_BOARD_PORT",
+    "SWARM_BOARD_IDLE_SECONDS",
+    "SWARM_BOARD_STATE_DIR",
+    "SWARM_BOARD_CONFIG",
+    "XDG_CACHE_HOME",
+)
+
+
+def _use_systemd_unit(
+    *,
+    host: str | None,
+    port: int | None,
+    idle_seconds: float | None,
+    state_dir: Path | None,
+    ui_dir: Path | None,
+) -> bool:
+    """True for default launches on Linux with systemctl; overrides keep the direct spawn path."""
+    if not sys.platform.startswith("linux") or shutil.which("systemctl") is None:
+        return False
+    if any(v is not None for v in (host, port, idle_seconds, state_dir, ui_dir)):
+        return False
+    return not any(key in os.environ for key in _UNIT_ENV_OVERRIDES)
+
+
+def _start_systemd_unit(*, block: bool = True, timeout_s: float = _SYSTEMCTL_TIMEOUT_S) -> None:
+    """Start the persistent server unit. block=False queues the start job and returns at once.
+
+    Raises RuntimeError if systemctl refuses (e.g. the unit is not installed).
+    """
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        raise RuntimeError("systemctl not found")
+    cmd = [systemctl, "--user", "start"]
+    if not block:
+        cmd.append("--no-block")
+    cmd.append(SYSTEMD_UNIT)
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        check=False,
+    )
+    if res.returncode != 0:
+        detail = (res.stderr or res.stdout or "").strip()
+        raise RuntimeError(
+            f"systemctl --user start {SYSTEMD_UNIT} failed: {detail}. "
+            "Install the unit first: see INSTALL.md, 'Linux: run the board as its own systemd user service'."
+        )
+
+
 def _spawn_detached_server(
     state_dir: Path,
     *,
@@ -1767,25 +1831,31 @@ def ensure_server(
             _stop_mismatched_host_if_verified(state_file, target_host, wait_s=2.0)
 
             proc: subprocess.Popen[bytes] | None = None
-            watch_pid = _active_starting_pid(starting_file, max_age_s=timeout_s)
-            if watch_pid is None:
-                try:
-                    state_file.unlink()
-                except OSError:
-                    pass
-                proc = _spawn_detached_server(
-                    resolved_state,
-                    host=target_host,
-                    port=port,
-                    idle_seconds=resolved_idle,
-                    explicit_state_dir=state_dir,
-                    ui_dir=ui_dir,
-                )
-                watch_pid = proc.pid
-                _atomic_write_json(
-                    starting_file,
-                    {"pid": proc.pid, "started_at": time.time()},
-                )
+            watch_pid: int | None = None
+            if _use_systemd_unit(
+                host=host, port=port, idle_seconds=idle_seconds, state_dir=state_dir, ui_dir=ui_dir
+            ):
+                # Starting a running unit is a no-op, so this cannot launch a second server.
+                # server.json is left alone: a failed probe must not erase the record of a live server.
+                _start_systemd_unit()
+            else:
+                watch_pid = _active_starting_pid(starting_file, max_age_s=timeout_s)
+                if watch_pid is None:
+                    # No unlink of server.json here. A child that loses the state lock exits 1 and must
+                    # leave the live owner's record intact; a new owner replaces the record after it binds.
+                    proc = _spawn_detached_server(
+                        resolved_state,
+                        host=target_host,
+                        port=port,
+                        idle_seconds=resolved_idle,
+                        explicit_state_dir=state_dir,
+                        ui_dir=ui_dir,
+                    )
+                    watch_pid = proc.pid
+                    _atomic_write_json(
+                        starting_file,
+                        {"pid": proc.pid, "started_at": time.time()},
+                    )
 
             deadline = time.monotonic() + max(0.5, float(timeout_s))
             while time.monotonic() < deadline:
@@ -1895,12 +1965,19 @@ def hook_ensure_server(
             ) is not None:
                 return {}
             _stop_mismatched_host_if_verified(state_file, target_host, wait_s=0.2)
+            if _use_systemd_unit(
+                host=host, port=port, idle_seconds=idle_seconds, state_dir=state_dir, ui_dir=ui_dir
+            ):
+                # Queued with --no-block (this hook holds ensure.lock). server.json is left alone: a failed
+                # probe must not erase the record of a live server.
+                try:
+                    _start_systemd_unit(block=False, timeout_s=_HOOK_SYSTEMCTL_TIMEOUT_S)
+                except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                    _LOGGER.warning("hook could not start %s: %s", SYSTEMD_UNIT, exc)
+                return {}
             if _active_starting_pid(starting_file) is not None:
                 return {}
-            try:
-                state_file.unlink()
-            except OSError:
-                pass
+            # No unlink of server.json here, for the same reason as in ensure_server.
             proc = _spawn_detached_server(
                 resolved_state,
                 host=target_host,
@@ -2024,6 +2101,23 @@ def stop_server(
     }
 
 
+def _acquire_state_owner_lock(state_dir: Path) -> Any | None:
+    """Hold an exclusive lock on state_dir/server.lock for the server's whole lifetime.
+
+    Only one server may own a state directory. Every launch path (the unit, a child process,
+    a manual run) goes through this, so a second server exits at once instead of overwriting
+    server.json. Returns the open file (keep it alive), or None when another server holds the lock.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    fh = open(state_dir / "server.lock", "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 def run_server(
     *,
     host: str | None = None,
@@ -2043,6 +2137,13 @@ def run_server(
     resolved_state = get_state_dir(state_dir)
     state_file = resolved_state / "server.json"
     starting_file = resolved_state / "starting.json"
+
+    owner_lock = _acquire_state_owner_lock(resolved_state)
+    if owner_lock is None:
+        _LOGGER.error(
+            "Another Swarm Board server already owns %s; not starting a second one.", resolved_state
+        )
+        return 1
 
     server = create_server(
         registry=registry,

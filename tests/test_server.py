@@ -23,9 +23,14 @@ from swarm_board.server import (
     DEFAULT_IDLE_SECONDS,
     REPO_ROOT,
     SERVER_VERSION,
+    _acquire_state_owner_lock,
+    _start_systemd_unit,
+    _use_systemd_unit,
     create_server,
     detect_tailscale_ipv4,
+    ensure_server,
     get_state_dir,
+    hook_ensure_server,
     is_loopback_host,
     is_tailscale_ipv4,
     is_valid_host_header,
@@ -1090,6 +1095,287 @@ class ServerLifecycleSubprocessTests(unittest.TestCase):
             self.assertEqual(health["idle_seconds"], 3600.0)
         finally:
             conn.close()
+
+
+class SystemdUnitModeTests(unittest.TestCase):
+    """Default launches use the persistent unit; any override keeps the direct spawn path."""
+
+    # Every key _use_systemd_unit checks. The baseline must clear all of them, or an inherited
+    # override would hide a broken per-key check.
+    _ENV_KEYS = (
+        "SWARM_BOARD_HOST",
+        "SWARM_BOARD_PORT",
+        "SWARM_BOARD_IDLE_SECONDS",
+        "SWARM_BOARD_STATE_DIR",
+        "SWARM_BOARD_CONFIG",
+        "XDG_CACHE_HOME",
+    )
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self.tmp.name) / "state"
+        self.state_dir.mkdir()
+        self.clean_env = {k: v for k, v in os.environ.items() if k not in self._ENV_KEYS}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_unit_mode_selection(self) -> None:
+        def pick(**overrides: object) -> bool:
+            kwargs: dict[str, object] = {
+                "host": None,
+                "port": None,
+                "idle_seconds": None,
+                "state_dir": None,
+                "ui_dir": None,
+            }
+            kwargs.update(overrides)
+            return _use_systemd_unit(**kwargs)  # type: ignore[arg-type]
+
+        with (
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server.sys.platform", "linux"),
+            mock.patch("swarm_board.server.shutil.which", return_value="/usr/bin/systemctl"),
+        ):
+            self.assertTrue(pick())
+            self.assertFalse(pick(port=0))
+            self.assertFalse(pick(host="127.0.0.1"))
+            self.assertFalse(pick(idle_seconds=30.0))
+            self.assertFalse(pick(state_dir=self.state_dir))
+            self.assertFalse(pick(ui_dir=self.state_dir))
+
+        with (
+            mock.patch.dict(os.environ, {**self.clean_env, "SWARM_BOARD_HOST": "tailscale"}, clear=True),
+            mock.patch("swarm_board.server.sys.platform", "linux"),
+            mock.patch("swarm_board.server.shutil.which", return_value="/usr/bin/systemctl"),
+        ):
+            self.assertFalse(pick())
+
+        with (
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server.sys.platform", "darwin"),
+            mock.patch("swarm_board.server.shutil.which", return_value="/usr/bin/systemctl"),
+        ):
+            self.assertFalse(pick())
+
+        with (
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server.sys.platform", "linux"),
+            mock.patch("swarm_board.server.shutil.which", return_value=None),
+        ):
+            self.assertFalse(pick())
+
+    def test_start_unit_command_and_failure_text(self) -> None:
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        missing = subprocess.CompletedProcess(
+            [], 5, stdout="", stderr="Unit swarm-board.service not found."
+        )
+        with (
+            mock.patch("swarm_board.server.shutil.which", return_value="/usr/bin/systemctl"),
+            mock.patch("swarm_board.server.subprocess.run", return_value=ok) as run,
+        ):
+            _start_systemd_unit()
+        self.assertEqual(
+            run.call_args.args[0], ["/usr/bin/systemctl", "--user", "start", "swarm-board.service"]
+        )
+
+        with (
+            mock.patch("swarm_board.server.shutil.which", return_value="/usr/bin/systemctl"),
+            mock.patch("swarm_board.server.subprocess.run", return_value=missing),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not found"):
+                _start_systemd_unit()
+
+    def test_ensure_unit_mode_starts_unit_and_never_spawns_child(self) -> None:
+        with (
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=True),
+            mock.patch("swarm_board.server._start_systemd_unit") as start,
+            mock.patch("swarm_board.server._spawn_detached_server") as spawn,
+        ):
+            # No server ever writes server.json here, so ensure must time out after starting the unit.
+            with self.assertRaises(TimeoutError):
+                ensure_server(state_dir=self.state_dir, timeout_s=0.5)
+        start.assert_called_once()
+        spawn.assert_not_called()
+
+    def test_each_override_env_key_keeps_direct_path(self) -> None:
+        with (
+            mock.patch("swarm_board.server.sys.platform", "linux"),
+            mock.patch("swarm_board.server.shutil.which", return_value="/usr/bin/systemctl"),
+        ):
+            for key in (
+                "SWARM_BOARD_HOST",
+                "SWARM_BOARD_PORT",
+                "SWARM_BOARD_IDLE_SECONDS",
+                "SWARM_BOARD_STATE_DIR",
+                "SWARM_BOARD_CONFIG",
+                "XDG_CACHE_HOME",
+            ):
+                # Presence counts, even when empty: the server reads an empty SWARM_BOARD_CONFIG as "no config".
+                with mock.patch.dict(os.environ, {**self.clean_env, key: ""}, clear=True):
+                    self.assertFalse(
+                        _use_systemd_unit(
+                            host=None, port=None, idle_seconds=None, state_dir=None, ui_dir=None
+                        ),
+                        key,
+                    )
+
+    def test_ensure_unit_mode_returns_healthy_server_after_unit_start(self) -> None:
+        # The fake start writes the record a real unit would write after binding; ensure must then
+        # find it healthy through the normal wait loop, not by timing out.
+        live = create_server(host="127.0.0.1", port=0, idle_seconds=30.0)
+        threading.Thread(target=live.serve_forever, daemon=True).start()
+        self.addCleanup(live.server_close)
+        self.addCleanup(live.shutdown)
+
+        def fake_start() -> None:
+            record = {
+                "pid": os.getpid(),
+                "host": "127.0.0.1",
+                "port": live.bound_port,
+                "url": f"http://127.0.0.1:{live.bound_port}",
+                "local_url": f"http://127.0.0.1:{live.bound_port}",
+            }
+            (self.state_dir / "server.json").write_text(json.dumps(record), encoding="utf-8")
+
+        with (
+            mock.patch("swarm_board.server.load_user_config", return_value={}),
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=True),
+            mock.patch("swarm_board.server._start_systemd_unit", side_effect=fake_start) as start,
+            mock.patch("swarm_board.server._spawn_detached_server") as spawn,
+        ):
+            result = ensure_server(state_dir=self.state_dir, timeout_s=5.0)
+        start.assert_called_once()
+        spawn.assert_not_called()
+        self.assertTrue(result["started"])
+        self.assertEqual(result["port"], live.bound_port)
+
+    def test_ensure_unit_mode_keeps_server_record_when_probe_fails(self) -> None:
+        record = self.state_dir / "server.json"
+        # Port 1 refuses connections, so the probe fails just like a missed probe on a live server.
+        record.write_text(
+            json.dumps({"pid": 999999, "host": "127.0.0.1", "port": 1}), encoding="utf-8"
+        )
+        with (
+            mock.patch("swarm_board.server.load_user_config", return_value={}),
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=True),
+            mock.patch("swarm_board.server._start_systemd_unit"),
+        ):
+            with self.assertRaises(TimeoutError):
+                ensure_server(state_dir=self.state_dir, timeout_s=0.5)
+        self.assertTrue(record.exists())
+
+    def test_hook_unit_mode_keeps_server_record(self) -> None:
+        record = self.state_dir / "server.json"
+        record.write_text(
+            json.dumps({"pid": 999999, "host": "127.0.0.1", "port": 1}), encoding="utf-8"
+        )
+        with (
+            mock.patch("swarm_board.server.load_user_config", return_value={}),
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=True),
+            mock.patch("swarm_board.server._start_systemd_unit"),
+            mock.patch("swarm_board.server._spawn_detached_server") as spawn,
+        ):
+            self.assertEqual(hook_ensure_server(state_dir=self.state_dir), {})
+        self.assertTrue(record.exists())
+        spawn.assert_not_called()
+
+    def test_state_owner_lock_allows_one_owner(self) -> None:
+        first = _acquire_state_owner_lock(self.state_dir)
+        self.assertIsNotNone(first)
+        assert first is not None
+        self.assertIsNone(_acquire_state_owner_lock(self.state_dir))
+        first.close()
+        third = _acquire_state_owner_lock(self.state_dir)
+        self.assertIsNotNone(third)
+        assert third is not None
+        third.close()
+
+    def test_hook_unit_mode_starts_unit_twice_without_spawning(self) -> None:
+        with (
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=True),
+            mock.patch("swarm_board.server._start_systemd_unit") as start,
+            mock.patch("swarm_board.server._spawn_detached_server") as spawn,
+        ):
+            self.assertEqual(hook_ensure_server(state_dir=self.state_dir), {})
+            self.assertEqual(hook_ensure_server(state_dir=self.state_dir), {})
+        self.assertEqual(start.call_count, 2)
+        spawn.assert_not_called()
+
+    def test_hook_unit_start_failure_is_logged_not_raised(self) -> None:
+        with (
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=True),
+            mock.patch(
+                "swarm_board.server._start_systemd_unit",
+                side_effect=RuntimeError("systemctl --user start swarm-board.service failed: not found"),
+            ),
+            self.assertLogs(level="WARNING") as logs,
+        ):
+            self.assertEqual(hook_ensure_server(state_dir=self.state_dir), {})
+        self.assertIn("not found", "\n".join(logs.output))
+
+    def test_hook_unit_start_is_queued_with_short_timeout(self) -> None:
+        # The hook holds ensure.lock while it starts the unit, so it must queue the job and not wait.
+        with (
+            mock.patch("swarm_board.server.load_user_config", return_value={}),
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=True),
+            mock.patch("swarm_board.server._start_systemd_unit") as start,
+        ):
+            self.assertEqual(hook_ensure_server(state_dir=self.state_dir), {})
+        start.assert_called_once()
+        self.assertIs(start.call_args.kwargs["block"], False)
+        self.assertLessEqual(start.call_args.kwargs["timeout_s"], 2.0)
+
+    def test_nonblocking_start_passes_no_block_and_timeout(self) -> None:
+        with (
+            mock.patch("swarm_board.server.shutil.which", return_value="/usr/bin/systemctl"),
+            mock.patch(
+                "swarm_board.server.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run,
+        ):
+            _start_systemd_unit(block=False, timeout_s=2.0)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/bin/systemctl", "--user", "start", "--no-block", "swarm-board.service"],
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 2.0)
+
+    def test_direct_ensure_keeps_record_when_child_loses_state_lock(self) -> None:
+        # Sol round 4 repro: a live owner's record must survive a new child that exits 1 at the lock.
+        record = self.state_dir / "server.json"
+        record.write_text(json.dumps({"pid": 999999, "host": "127.0.0.1", "port": 1}), encoding="utf-8")
+        fake_child = mock.Mock(pid=424242, returncode=1)
+        fake_child.poll.return_value = 1
+        with (
+            mock.patch("swarm_board.server.load_user_config", return_value={}),
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=False),
+            mock.patch("swarm_board.server._spawn_detached_server", return_value=fake_child) as spawn,
+        ):
+            with self.assertRaises(RuntimeError):
+                ensure_server(state_dir=self.state_dir, port=1, timeout_s=5.0)
+        spawn.assert_called_once()
+        self.assertTrue(record.exists())
+
+    def test_direct_hook_keeps_record_when_spawning(self) -> None:
+        record = self.state_dir / "server.json"
+        record.write_text(json.dumps({"pid": 999999, "host": "127.0.0.1", "port": 1}), encoding="utf-8")
+        with (
+            mock.patch("swarm_board.server.load_user_config", return_value={}),
+            mock.patch.dict(os.environ, self.clean_env, clear=True),
+            mock.patch("swarm_board.server._use_systemd_unit", return_value=False),
+            mock.patch(
+                "swarm_board.server._spawn_detached_server", return_value=mock.Mock(pid=424242)
+            ) as spawn,
+        ):
+            self.assertEqual(hook_ensure_server(state_dir=self.state_dir, port=1), {})
+        spawn.assert_called_once()
+        self.assertTrue(record.exists())
 
 
 if __name__ == "__main__":

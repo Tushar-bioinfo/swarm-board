@@ -20,11 +20,35 @@ Useful flags:
 - `python3 scripts/install.py --verify` — validate Python version, UI build, executable bits, skills, and hooks
 - `python3 scripts/install.py --uninstall` — remove only swarm-board symlinks and hooks (preserves all other configs)
 
+### Linux only: install the systemd user unit
+
+Linux needs this once, or `scripts/ensure-server.sh --ensure` fails with `systemctl --user start swarm-board.service failed`. Run it from the repo root (same commands as section 2, step 4):
+
+```bash
+mkdir -p ~/.config/systemd/user ~/.cache/swarm-board
+cat > ~/.config/systemd/user/swarm-board.service <<EOF
+[Unit]
+Description=Swarm Board HTTP/SSE server
+
+[Service]
+Type=simple
+WorkingDirectory=$(pwd)
+Environment="PYTHONPATH=$(pwd)"
+Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart="$(command -v python3)" -m swarm_board.server
+StandardOutput=append:$HOME/.cache/swarm-board/server.log
+StandardError=append:$HOME/.cache/swarm-board/server.log
+EOF
+systemctl --user daemon-reload
+```
+
+**Existing Linux installs:** after upgrading, run the same block again (it overwrites the unit file), then run `scripts/ensure-server.sh --stop`. The next `--ensure` starts the updated unit.
+
 ---
 
 ## 2. Agent Setup Instructions
 
-If you ask an AI coding agent on a new Mac or Linux machine *"Set up swarm-board using INSTALL.md"*, the agent can follow this exact 4-step checklist:
+If you ask an AI coding agent on a new Mac or Linux machine *"Set up swarm-board using INSTALL.md"*, the agent can follow this exact 5-step checklist:
 
 1. **Ensure repo is cloned locally** and enter its root directory (`cd /path/to/swarm-board`).
 2. **Install skill symlinks & hooks** (builds `swarm_board/ui/index.html` if needed and sets `+x` permissions):
@@ -35,7 +59,8 @@ If you ask an AI coding agent on a new Mac or Linux machine *"Set up swarm-board
    ```bash
    python3 scripts/install.py --verify && python3 -m unittest discover -s tests -v
    ```
-4. **Smoke-test server lifecycle & clean up**:
+4. **Linux only: install the systemd user unit** (skip on macOS). Run the block under section 1, "Linux only: install the systemd user unit", from the repo root. It fills in the repo path, the Python path, and `$HOME`.
+5. **Smoke-test server lifecycle & clean up**:
    ```bash
    scripts/ensure-server.sh --ensure && scripts/ensure-server.sh --status && scripts/ensure-server.sh --stop
    ```
@@ -78,6 +103,16 @@ When Swarm Board runs on a headless Linux VM and you want to open it directly in
 ```
 
 Or pass `--host tailscale` / `SWARM_BOARD_HOST=tailscale`. In Tailscale mode, Swarm Board binds **only** the VM's Tailscale `100.64.0.0/10` IPv4 interface plus a companion `127.0.0.1` loopback listener on the same port (never `0.0.0.0` or public/LAN interfaces), validates Tailscale/MagicDNS/loopback `Host` headers, and returns both `url` (`http://<tailscale-ip>:18420`, for Mac) and `local_url` (`http://127.0.0.1:18420`, for VM).
+
+### Linux: run the board as its own systemd user service
+
+Agent sessions run in their own systemd scopes, and systemd stops everything in a scope when the session ends. A board started from inside a session would stop with it. On Linux, step 4 of the setup checklist (section 2) installs one user unit. `ensure` then starts that unit, and starting a unit that is already running does nothing.
+
+- The unit reads the host and idle time from `config.json`, and it uses the default state directory.
+- Launches that pass `--port`, `--host`, `--idle-seconds`, `--state-dir`, or `--ui-dir`, or that set `SWARM_BOARD_HOST`, `SWARM_BOARD_PORT`, `SWARM_BOARD_IDLE_SECONDS`, `SWARM_BOARD_STATE_DIR`, `SWARM_BOARD_CONFIG`, or `XDG_CACHE_HOME`, still start a direct child process.
+- The unit does not start at boot. After a reboot, the board starts on the next `ensure` or hook call.
+- Each server holds `server.lock` in its state directory for its whole life. A second server for the same state directory exits at once instead of overwriting `server.json`.
+- macOS has no systemd, so it always uses the direct child process.
 
 ---
 

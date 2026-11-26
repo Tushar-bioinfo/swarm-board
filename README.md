@@ -18,6 +18,28 @@ python3 scripts/install.py
 python3 scripts/install.py --verify
 ```
 
+**Linux only:** also install the systemd user unit once. Without it, `scripts/ensure-server.sh --ensure` fails. Run from the repo root:
+
+```bash
+mkdir -p ~/.config/systemd/user ~/.cache/swarm-board
+cat > ~/.config/systemd/user/swarm-board.service <<EOF
+[Unit]
+Description=Swarm Board HTTP/SSE server
+
+[Service]
+Type=simple
+WorkingDirectory=$(pwd)
+Environment="PYTHONPATH=$(pwd)"
+Environment="PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart="$(command -v python3)" -m swarm_board.server
+StandardOutput=append:$HOME/.cache/swarm-board/server.log
+StandardError=append:$HOME/.cache/swarm-board/server.log
+EOF
+systemctl --user daemon-reload
+```
+
+**Existing Linux installs:** after upgrading, run the same block again, then `scripts/ensure-server.sh --stop`. The next `--ensure` starts the updated unit.
+
 See [INSTALL.md](./INSTALL.md) for cross-platform paths, tool compatibility (T3 Code, Antigravity, Claude Code, Codex, Grok), and agent setup steps.
 
 ## Commands
