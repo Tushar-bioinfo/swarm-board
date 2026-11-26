@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,9 @@ from swarm_board.server import (
     resolve_bind_host,
     resolve_idle_seconds,
     resolve_open_in_preview,
+    resolve_port,
+    server_status,
+    stop_server,
 )
 
 
@@ -645,6 +649,339 @@ class ServerUnitAndApiTests(unittest.TestCase):
             time.sleep(0.03)
         self.assertFalse(self.server.sse_hub.poller_active())
 
+    def test_api_active_real_and_mock_fallback_and_health_no_cold_scan(self) -> None:
+        # 1. Cold registry: /health must report 0 without triggering adapter discovery
+        reg_cold = BoardRegistry(
+            {
+                "committee_dir": self.root / "no-com",
+                "orchestrate_dir": self.root / "no-orch",
+                "sessions_ledger": self.root / "no-ledger",
+                "grok_sessions_root": self.root / "no-grok",
+                "codex_db": self.root / "no-codex",
+                "claude_root": self.root / "no-claude",
+                "brain_roots": [],
+                "statev2_db": self.root / "no-t3.sqlite",
+                "dropin_dir": self.dropin_dir,
+                "rates_path": self.root / "no-rates",
+                "usage_cache_path": self.root / "no-usage",
+            },
+            cache_ttl_s=0.0,
+        )
+        srv_cold = create_server(reg_cold, port=0, ui_dir=self.ui_dir, idle_seconds=0)
+        th_cold = threading.Thread(target=srv_cold.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        th_cold.start()
+        self.addCleanup(th_cold.join, 2.0)
+        self.addCleanup(srv_cold.server_close)
+        self.addCleanup(srv_cold.request_shutdown)
+
+        with mock.patch.object(
+            reg_cold,
+            "_collect_all_flows_unlocked",
+            side_effect=AssertionError("/health must not force cold scan"),
+        ):
+            conn = http.client.HTTPConnection("127.0.0.1", srv_cold.bound_port, timeout=3.0)
+            try:
+                conn.request("GET", "/health", headers={"Host": f"127.0.0.1:{srv_cold.bound_port}"})
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                h_cold = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(h_cold["flows_count"], 0)
+                self.assertEqual(h_cold["activeCount"], 0)
+                self.assertFalse(reg_cold._has_snapshot)
+            finally:
+                conn.close()
+
+        # 2. Real registry with live flow -> activeCount in /api/flows and /health, and /api/active payload
+        self._write_flow(state="running", last="Busy now")
+        st_fl, _, body_fl = self._request("GET", "/api/flows?force=1")
+        self.assertEqual(st_fl, 200)
+        fl_data = json.loads(body_fl.decode("utf-8"))
+        self.assertEqual(fl_data["activeCount"], 1)
+
+        st_h, _, body_h = self._request("GET", "/health")
+        self.assertEqual(st_h, 200)
+        self.assertEqual(json.loads(body_h.decode("utf-8"))["activeCount"], 1)
+
+        st_a, _, body_a = self._request("GET", "/api/active?force=1")
+        self.assertEqual(st_a, 200)
+        act = json.loads(body_a.decode("utf-8"))
+        self.assertTrue(act["ok"])
+        self.assertEqual(act["liveCount"], 1)
+        self.assertEqual(len(act["threads"]), 1)
+        self.assertEqual(act["threads"][0]["flowId"], self.flow_id)
+        self.assertTrue(act["threads"][0]["isLive"])
+        self.assertEqual(
+            set(act["threads"][0].keys()),
+            {
+                "id",
+                "flowId",
+                "rootThreadId",
+                "parentThreadId",
+                "title",
+                "project",
+                "projectRoot",
+                "harness",
+                "state",
+                "isLive",
+                "settled",
+                "model",
+                "lab",
+                "startedAt",
+                "updatedAt",
+                "durS",
+                "activeChildren",
+                "totalChildren",
+                "last",
+                "href",
+                "links",
+            },
+        )
+
+        # 3. Mock registry lacking list_active_threads and get_active_count -> fallback derivation
+        class _MinimalMockRegistry:
+            last_errors: dict[str, str] = {}
+
+            def list_flows(self, force: bool = False) -> list[dict]:
+                return [
+                    {
+                        "id": "mock:live",
+                        "title": "Mock Live",
+                        "project": "mockproj",
+                        "projectRoot": str(self.proj) if hasattr(self, "proj") else None,
+                        "harness": "dropin",
+                        "startedAt": "2026-11-25T11:00:00Z",
+                        "updatedAt": "2026-11-25T11:05:00Z",
+                        "agents": [
+                            {
+                                "id": "w1",
+                                "name": "Worker",
+                                "role": "worker",
+                                "lab": "openai",
+                                "model": "gpt-6",
+                                "state": "waiting",
+                                "last": "Needs input",
+                            }
+                        ],
+                    }
+                ]
+
+            def snapshot_digest(self) -> str:
+                return "mock-digest"
+
+        mock_srv = create_server(_MinimalMockRegistry(), port=0, ui_dir=self.ui_dir, idle_seconds=0)
+        th_mock = threading.Thread(target=mock_srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        th_mock.start()
+        self.addCleanup(th_mock.join, 2.0)
+        self.addCleanup(mock_srv.server_close)
+        self.addCleanup(mock_srv.request_shutdown)
+
+        for route, check_fn in (
+            (
+                "/api/active",
+                lambda d: (
+                    self.assertEqual(d["liveCount"], 1),
+                    self.assertEqual(d["threads"][0]["flowId"], "mock:live"),
+                    self.assertEqual(d["threads"][0]["state"], "waiting"),
+                ),
+            ),
+            (
+                "/api/flows",
+                lambda d: self.assertEqual(d["activeCount"], 1),
+            ),
+            (
+                "/health",
+                lambda d: self.assertEqual(d["activeCount"], 1),
+            ),
+        ):
+            conn = http.client.HTTPConnection("127.0.0.1", mock_srv.bound_port, timeout=3.0)
+            try:
+                conn.request("GET", route, headers={"Host": f"127.0.0.1:{mock_srv.bound_port}"})
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200, route)
+                check_fn(json.loads(resp.read().decode("utf-8")))
+            finally:
+                conn.close()
+
+    def test_server_close_closes_registry(self) -> None:
+        mock_reg = mock.Mock()
+        mock_reg.close = mock.Mock()
+        srv = create_server(mock_reg, port=0, ui_dir=self.ui_dir, idle_seconds=0)
+        srv.server_close()
+        mock_reg.close.assert_called_once()
+
+    def test_snapshot_digest_and_sse_update_on_standalone_t3_active_thread(self) -> None:
+        db_path = self.root / "t3_live.sqlite"
+        con = sqlite3.connect(str(db_path))
+        con.executescript(
+            """
+            CREATE TABLE projection_projects (
+                project_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                workspace_root TEXT NOT NULL
+            );
+            CREATE TABLE orchestration_v2_projection_threads (
+                thread_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                default_provider TEXT,
+                provider_instance_id TEXT,
+                active_provider_thread_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT,
+                deleted_at TEXT,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE orchestration_v2_projection_subagents (
+                subagent_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                parent_node_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                driver TEXT NOT NULL,
+                provider_instance_id TEXT NOT NULL,
+                provider_thread_id TEXT,
+                child_thread_id TEXT,
+                origin TEXT NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE orchestration_v2_projection_runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                ordinal INTEGER,
+                requested_at TEXT
+            );
+            CREATE TABLE orchestration_v2_projection_provider_threads (
+                provider_thread_id TEXT PRIMARY KEY,
+                thread_id TEXT,
+                provider TEXT,
+                driver TEXT,
+                updated_at TEXT,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE orchestration_v2_projection_messages (
+                message_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                run_id TEXT,
+                node_id TEXT,
+                role TEXT NOT NULL,
+                streaming INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            INSERT INTO projection_projects VALUES ('p1', 'Proj', '/tmp/proj');
+            """
+        )
+        con.commit()
+        con.close()
+
+        reg = BoardRegistry(
+            {
+                "committee_dir": self.root / "no-com",
+                "orchestrate_dir": self.root / "no-orch",
+                "sessions_ledger": self.root / "no-ledger",
+                "grok_sessions_root": self.root / "no-grok",
+                "codex_db": self.root / "no-codex",
+                "claude_root": self.root / "no-claude",
+                "brain_roots": [],
+                "statev2_db": db_path,
+                "dropin_dir": self.root / "no-drop",
+                "rates_path": self.root / "no-rates",
+                "usage_cache_path": self.root / "no-usage",
+                "env_id": "env-sse",
+            },
+            cache_ttl_s=0.0,
+        )
+        srv = create_server(
+            reg,
+            port=0,
+            ui_dir=self.ui_dir,
+            idle_seconds=0,
+            sse_poll_interval_s=0.08,
+            sse_heartbeat_interval_s=0.5,
+        )
+        th = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        th.start()
+        self.addCleanup(th.join, 2.0)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.request_shutdown)
+
+        sock = socket.create_connection(("127.0.0.1", srv.bound_port), timeout=5.0)
+        try:
+            sock.sendall(
+                (
+                    f"GET /events HTTP/1.1\r\n"
+                    f"Host: 127.0.0.1:{srv.bound_port}\r\n"
+                    f"Accept: text/event-stream\r\n\r\n"
+                ).encode("ascii")
+            )
+            buf = bytearray()
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(4096)
+                self.assertTrue(chunk)
+                buf.extend(chunk)
+            del buf[: buf.find(b"\r\n\r\n") + 4]
+
+            ev0, d0, _ = _read_sse_event(sock, buf, timeout=3.0)
+            self.assertEqual(ev0, "ready")
+            assert d0 is not None
+
+            # Insert standalone live T3 thread -> SSE must emit update with new digest
+            con = sqlite3.connect(str(db_path))
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-live', 'p1', 'Live Standalone', 'claude', 'claude', NULL, '2026-11-25T11:50:00Z', '2026-11-25T11:55:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-live"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-1', 'thr-live', 'running', 1, '2026-11-25T11:55:00Z')"
+            )
+            con.commit()
+            con.close()
+
+            upd1 = None
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                ev, payload, _ = _read_sse_event(sock, buf, timeout=2.0)
+                if ev == "update":
+                    upd1 = payload
+                    break
+            self.assertIsNotNone(upd1)
+            assert upd1 is not None
+            self.assertNotEqual(upd1["digest"], d0["digest"])
+
+            # Complete the run -> SSE must emit another update with a changed digest
+            con = sqlite3.connect(str(db_path))
+            con.execute("UPDATE orchestration_v2_projection_runs SET status = 'completed' WHERE run_id = 'run-1'")
+            con.commit()
+            con.close()
+
+            upd2 = None
+            deadline2 = time.monotonic() + 3.0
+            while time.monotonic() < deadline2:
+                ev, payload, _ = _read_sse_event(sock, buf, timeout=2.0)
+                if ev == "update":
+                    upd2 = payload
+                    break
+            self.assertIsNotNone(upd2)
+            assert upd2 is not None
+            self.assertNotEqual(upd2["digest"], upd1["digest"])
+        finally:
+            sock.close()
+
+    def test_nul_byte_rejected_on_file_and_raw_endpoints(self) -> None:
+        self._request("GET", "/api/flows?force=1")
+        enc_flow = quote(self.flow_id, safe="")
+        st_f, _, _ = self._request("GET", f"/api/file?flow={enc_flow}&path=src%00app.py&line=1")
+        self.assertEqual(st_f, 403)
+        st_r, _, _ = self._request("GET", f"/api/raw?flow={enc_flow}&path=media%00clip.bin")
+        self.assertEqual(st_r, 403)
+
 
 class ServerLifecycleSubprocessTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1095,6 +1432,55 @@ class ServerLifecycleSubprocessTests(unittest.TestCase):
             self.assertEqual(health["idle_seconds"], 3600.0)
         finally:
             conn.close()
+
+    def test_swarm_board_port_env_override_and_missing_server_json_recovery(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = int(probe.getsockname()[1])
+
+        env = self._env()
+        env["SWARM_BOARD_PORT"] = str(free_port)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(resolve_port(None, use_env=True), free_port)
+            p_ens = subprocess.run(
+                [sys.executable, "-m", "swarm_board.server", "--ensure", "--idle-seconds", "30"],
+                cwd=str(REPO_ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+                check=True,
+            )
+            res = json.loads(p_ens.stdout.strip())
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["started"])
+            self.assertEqual(res["port"], free_port)
+            pid = int(res["pid"])
+            self._pids_to_cleanup.append(pid)
+
+            st1 = server_status()
+            self.assertTrue(st1["running"])
+            self.assertEqual(st1["pid"], pid)
+            self.assertEqual(st1["port"], free_port)
+
+            # Remove server.json and verify SWARM_BOARD_PORT probe recovers live server
+            state_file = self.state_dir / "server.json"
+            if state_file.exists():
+                state_file.unlink()
+
+            st2 = server_status()
+            self.assertTrue(st2["running"])
+            self.assertEqual(st2["pid"], pid)
+            self.assertEqual(st2["port"], free_port)
+
+            res2 = ensure_server(idle_seconds=30.0)
+            self.assertFalse(res2["started"])
+            self.assertEqual(res2["pid"], pid)
+            self.assertEqual(res2["port"], free_port)
+
+            stopped = stop_server()
+            self.assertTrue(stopped["stopped"])
+            self.assertEqual(stopped["port"], free_port)
 
 
 class SystemdUnitModeTests(unittest.TestCase):

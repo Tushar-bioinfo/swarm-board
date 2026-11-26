@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
 import json
 import os
 from pathlib import Path
@@ -29,15 +29,86 @@ from swarm_board.schema import (
 
 GROK_CLUSTER_WINDOW_S = 7200.0
 GROK_STALE_THRESHOLD_S = 600.0
+CLAUDE_STALE_THRESHOLD_S = 600.0
 GROK_COST_TICKS_PER_USD = 1e10
 TAIL_READ_BYTES = 24_576
+_MISSING = object()
+_LRU_CACHE_MAX = 256
+_FLOWS_CACHE_MAX = 32
 
 _DEFAULT_RATE_TABLE = RateTable()
 _DEFAULT_USAGE_INDEX = UsageIndex()
-_CLAUDE_HEAD_CACHE: dict[str, tuple[int, int, str | None]] = {}
-_GROK_EVENTS_TRACE_CACHE: dict[str, tuple[int, int, list[list[Any]]]] = {}
-_CLAUDE_TRACE_CACHE: dict[str, tuple[int, int, list[list[Any]]]] = {}
+_CLAUDE_HEAD_CACHE: OrderedDict[str, tuple[int, int, str | None]] = OrderedDict()
+_GROK_EVENTS_TRACE_CACHE: OrderedDict[str, tuple[int, int, list[list[Any]]]] = OrderedDict()
+_CLAUDE_TRACE_CACHE: OrderedDict[str, tuple[int, int, list[list[Any]]]] = OrderedDict()
+_GROK_SESSION_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+_GROK_FLOWS_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+_CODEX_FLOWS_CACHE: OrderedDict[tuple[str, str], tuple[Any, ...]] = OrderedDict()
+_CLAUDE_FLOWS_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+_DROPIN_FLOWS_CACHE: OrderedDict[str, tuple[Any, ...]] = OrderedDict()
 _TRUNCATED_CONTENT_RE = re.compile(r'"content"\s*:\s*"((?:\\.|[^"\\]){1,1024})')
+
+
+def _lru_get(cache: OrderedDict[Any, Any], key: Any) -> Any:
+    val = cache.get(key, _MISSING)
+    if val is not _MISSING:
+        cache.move_to_end(key)
+    return val
+
+
+def _lru_set(cache: OrderedDict[Any, Any], key: Any, val: Any, max_size: int) -> None:
+    if key in cache:
+        cache.move_to_end(key)
+    cache[key] = val
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def _stat_sig(path: Path | str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _stat_ino_sig(path: Path | str) -> tuple[int, int, int] | None:
+    try:
+        st = os.stat(path)
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _safe_mtime(path: Path | str) -> float | None:
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _refresh_running_durations(
+    flows: list[dict[str, Any]],
+    now_ts: float,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for f in flows:
+        agents = f.get("agents") or ()
+        if not any(isinstance(a, dict) and a.get("state") == "running" for a in agents):
+            out.append(f)
+            continue
+        new_agents = []
+        for a in agents:
+            if isinstance(a, dict) and a.get("state") == "running":
+                a_copy = dict(a)
+                a_copy["durS"] = compute_dur_s(a.get("startedAt"), None, is_running=True, now_ts=now_ts)
+                new_agents.append(a_copy)
+            else:
+                new_agents.append(a)
+        f_copy = dict(f)
+        f_copy["agents"] = new_agents
+        out.append(f_copy)
+    return out
 
 
 def _parse_grok_events_trace(path: Path) -> list[list[Any]]:
@@ -47,8 +118,8 @@ def _parse_grok_events_trace(path: Path) -> list[list[Any]]:
         st = path.stat()
     except OSError:
         return []
-    cached = _GROK_EVENTS_TRACE_CACHE.get(key)
-    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+    cached = _lru_get(_GROK_EVENTS_TRACE_CACHE, key)
+    if cached is not _MISSING and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
         return cached[2]
 
     counts: Counter[str] = Counter()
@@ -72,9 +143,7 @@ def _parse_grok_events_trace(path: Path) -> list[list[Any]]:
         return []
 
     trace = [[name, count] for name, count in counts.most_common()]
-    if len(_GROK_EVENTS_TRACE_CACHE) > 512:
-        _GROK_EVENTS_TRACE_CACHE.clear()
-    _GROK_EVENTS_TRACE_CACHE[key] = (st.st_mtime_ns, st.st_size, trace)
+    _lru_set(_GROK_EVENTS_TRACE_CACHE, key, (st.st_mtime_ns, st.st_size, trace), _LRU_CACHE_MAX)
     return trace
 
 
@@ -85,8 +154,8 @@ def _parse_claude_subagent_trace(path: Path) -> list[list[Any]]:
         st = path.stat()
     except OSError:
         return []
-    cached = _CLAUDE_TRACE_CACHE.get(key)
-    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+    cached = _lru_get(_CLAUDE_TRACE_CACHE, key)
+    if cached is not _MISSING and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
         return cached[2]
 
     counts: Counter[str] = Counter()
@@ -116,9 +185,7 @@ def _parse_claude_subagent_trace(path: Path) -> list[list[Any]]:
         return []
 
     trace = [[name, count] for name, count in counts.most_common()]
-    if len(_CLAUDE_TRACE_CACHE) > 512:
-        _CLAUDE_TRACE_CACHE.clear()
-    _CLAUDE_TRACE_CACHE[key] = (st.st_mtime_ns, st.st_size, trace)
+    _lru_set(_CLAUDE_TRACE_CACHE, key, (st.st_mtime_ns, st.st_size, trace), _LRU_CACHE_MAX)
     return trace
 
 
@@ -145,8 +212,8 @@ def _read_head_user_prompt(
         st = path.stat()
     except OSError:
         return None
-    cached = _CLAUDE_HEAD_CACHE.get(key)
-    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+    cached = _lru_get(_CLAUDE_HEAD_CACHE, key)
+    if cached is not _MISSING and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
         return cached[2]
 
     result: str | None = None
@@ -195,9 +262,7 @@ def _read_head_user_prompt(
     except OSError:
         return None
 
-    if len(_CLAUDE_HEAD_CACHE) > 512:
-        _CLAUDE_HEAD_CACHE.clear()
-    _CLAUDE_HEAD_CACHE[key] = (st.st_mtime_ns, st.st_size, result)
+    _lru_set(_CLAUDE_HEAD_CACHE, key, (st.st_mtime_ns, st.st_size, result), _LRU_CACHE_MAX)
     return result
 
 
@@ -296,16 +361,48 @@ def _parse_grok_session(
     *,
     rate_table: RateTable,
     now_ts: float,
+    use_cache: bool = True,
 ) -> dict[str, Any] | None:
-    summary = _safe_json_load(session_dir / "summary.json")
+    summary_path = session_dir / "summary.json"
+    usage_path = session_dir / "usage.json"
+    events_path = session_dir / "events.jsonl"
+    chat_path = session_dir / "chat_history.jsonl"
+    sess_sig = (
+        _stat_sig(summary_path),
+        _stat_sig(usage_path),
+        _stat_sig(events_path),
+        _stat_sig(chat_path),
+    )
+    sess_key = (str(session_dir), rate_table.cache_signature())
+    if use_cache:
+        cached = _lru_get(_GROK_SESSION_CACHE, sess_key)
+        if cached is not _MISSING:
+            c_sig, c_parsed = cached
+            if c_sig == sess_sig:
+                if c_parsed is None:
+                    return None
+                c_state = c_parsed["state"]
+                c_ref = c_parsed.get("ref_mtime")
+                if c_state not in ("running", "waiting", "queued") or (
+                    c_ref is not None and (now_ts - c_ref) <= GROK_STALE_THRESHOLD_S
+                ):
+                    return c_parsed
+
+    summary = _safe_json_load(summary_path)
     if not isinstance(summary, dict):
+        if use_cache:
+            _lru_set(_GROK_SESSION_CACHE, sess_key, (sess_sig, None), _LRU_CACHE_MAX)
         return None
     if summary.get("session_kind") != "headless":
+        if use_cache:
+            _lru_set(_GROK_SESSION_CACHE, sess_key, (sess_sig, None), _LRU_CACHE_MAX)
         return None
 
     info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
     sid = str(info.get("id") or session_dir.name).strip()
     if not sid:
+        if use_cache:
+            _lru_set(_GROK_SESSION_CACHE, sess_key, (sess_sig, None), _LRU_CACHE_MAX)
         return None
 
     cwd = str(info.get("cwd") or summary.get("git_root_dir") or "").strip()
@@ -318,7 +415,7 @@ def _parse_grok_session(
     created_ts = parse_iso_ts(summary.get("created_at"))
     updated_ts = parse_iso_ts(summary.get("updated_at") or summary.get("last_active_at"))
 
-    usage_doc = _safe_json_load(session_dir / "usage.json")
+    usage_doc = _safe_json_load(usage_path)
     usage_sess = (
         usage_doc.get("session")
         if isinstance(usage_doc, dict) and isinstance(usage_doc.get("session"), dict)
@@ -358,9 +455,6 @@ def _parse_grok_session(
         )
 
     # Tail-inspect events.jsonl and chat_history.jsonl (never read updates.jsonl).
-    events_path = session_dir / "events.jsonl"
-    chat_path = session_dir / "chat_history.jsonl"
-
     state = "done"
     tail_events = _read_tail_jsonl(events_path) if events_path.is_file() else []
     turn_outcome: str | None = None
@@ -376,17 +470,19 @@ def _parse_grok_session(
             last_assistant = msg["content"].strip()
             break
 
+    ref_mtime = updated_ts
+    for probe in (events_path, chat_path, summary_path):
+        m = _safe_mtime(probe)
+        if m is not None and (ref_mtime is None or m > ref_mtime):
+            ref_mtime = m
+
     if turn_outcome:
         state = normalize_state(turn_outcome)
+        if state in ("running", "waiting", "queued") and (
+            ref_mtime is None or (now_ts - ref_mtime) > GROK_STALE_THRESHOLD_S
+        ):
+            state = "stale"
     else:
-        ref_mtime = updated_ts
-        for probe in (events_path, chat_path, session_dir / "summary.json"):
-            try:
-                m = probe.stat().st_mtime
-                if ref_mtime is None or m > ref_mtime:
-                    ref_mtime = m
-            except OSError:
-                pass
         if last_assistant:
             state = "done"
         elif ref_mtime is not None and (now_ts - ref_mtime) <= GROK_STALE_THRESHOLD_S:
@@ -401,7 +497,7 @@ def _parse_grok_session(
     except OSError:
         chat_size = None
 
-    return {
+    parsed = {
         "sid": sid,
         "cwd": cwd,
         "title": title,
@@ -411,6 +507,7 @@ def _parse_grok_session(
         "reasoning_effort": summary.get("reasoning_effort"),
         "created_ts": created_ts,
         "updated_ts": updated_ts,
+        "ref_mtime": ref_mtime,
         "state": state,
         "tokens": tokens,
         "cache_read": cache_read,
@@ -422,6 +519,9 @@ def _parse_grok_session(
         "chat_path": str(chat_path) if chat_path.is_file() else None,
         "chat_size": chat_size,
     }
+    if use_cache:
+        _lru_set(_GROK_SESSION_CACHE, sess_key, (sess_sig, parsed), _LRU_CACHE_MAX)
+    return parsed
 
 
 def _discover_grok_flows(
@@ -429,27 +529,77 @@ def _discover_grok_flows(
     *,
     rate_table: RateTable,
     now_ts: float,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     if not grok_sessions_root.is_dir():
         return []
 
-    sessions_by_cwd: dict[str, list[dict[str, Any]]] = {}
+    sess_dirs: list[tuple[str, Path]] = []
+    tree_sigs: list[Any] = []
     try:
-        project_dirs = sorted(p for p in grok_sessions_root.iterdir() if p.is_dir())
+        with os.scandir(grok_sessions_root) as proj_it:
+            proj_entries = sorted(
+                (e for e in proj_it if e.is_dir()),
+                key=lambda e: e.name,
+            )
     except OSError:
         return []
 
-    for pdir in project_dirs:
+    for p_entry in proj_entries:
+        pdir = Path(p_entry.path)
         try:
-            sdirs = sorted(p for p in pdir.iterdir() if p.is_dir())
+            with os.scandir(pdir) as sess_it:
+                s_entries = sorted(
+                    (e for e in sess_it if e.is_dir()),
+                    key=lambda e: e.name,
+                )
         except OSError:
             continue
-        for sdir in sdirs:
-            parsed = _parse_grok_session(sdir, rate_table=rate_table, now_ts=now_ts)
-            if parsed is None:
-                continue
-            cwd_key = parsed["cwd"] or pdir.name
-            sessions_by_cwd.setdefault(cwd_key, []).append(parsed)
+        s_sigs: list[Any] = []
+        for s_entry in s_entries:
+            sdir = Path(s_entry.path)
+            sess_dirs.append((p_entry.name, sdir))
+            if use_cache:
+                s_sigs.append(
+                    (
+                        s_entry.name,
+                        _stat_sig(sdir / "summary.json"),
+                        _stat_sig(sdir / "usage.json"),
+                        _stat_sig(sdir / "events.jsonl"),
+                        _stat_sig(sdir / "chat_history.jsonl"),
+                    )
+                )
+        if use_cache:
+            tree_sigs.append((p_entry.name, tuple(s_sigs)))
+
+    rt_sig = rate_table.cache_signature()
+    cache_key = (str(grok_sessions_root), rt_sig)
+    sig = tuple(tree_sigs) if use_cache else None
+    if use_cache and sig is not None:
+        cached = _lru_get(_GROK_FLOWS_CACHE, cache_key)
+        if cached is not _MISSING:
+            c_sig, c_running_mtimes, c_flows = cached
+            if c_sig == sig and not any(
+                rm is None or (now_ts - rm) > GROK_STALE_THRESHOLD_S
+                for rm in c_running_mtimes
+            ):
+                return _refresh_running_durations(c_flows, now_ts)
+
+    sessions_by_cwd: dict[str, list[dict[str, Any]]] = {}
+    running_ref_mtimes: list[float | None] = []
+    for proj_name, sdir in sess_dirs:
+        parsed = _parse_grok_session(
+            sdir,
+            rate_table=rate_table,
+            now_ts=now_ts,
+            use_cache=use_cache,
+        )
+        if parsed is None:
+            continue
+        if parsed["state"] in ("running", "waiting", "queued"):
+            running_ref_mtimes.append(parsed.get("ref_mtime"))
+        cwd_key = parsed["cwd"] or proj_name
+        sessions_by_cwd.setdefault(cwd_key, []).append(parsed)
 
     flows: list[dict[str, Any]] = []
     for cwd_key, items in sessions_by_cwd.items():
@@ -573,6 +723,9 @@ def _discover_grok_flows(
                 )
             )
 
+    if use_cache and sig is not None:
+        _lru_set(_GROK_FLOWS_CACHE, cache_key, (sig, running_ref_mtimes, flows), _FLOWS_CACHE_MAX)
+
     return flows
 
 
@@ -587,13 +740,29 @@ def _discover_codex_flows(
     rate_table: RateTable,
     usage_index: UsageIndex,
     now_ts: float,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     if not codex_db_path.is_file():
         return []
 
+    db_sig = _stat_ino_sig(codex_db_path)
+    wal_sig = _stat_ino_sig(f"{codex_db_path}-wal")
+    rt_sig = rate_table.cache_signature()
+    ui_sig = _stat_ino_sig(usage_index.path)
+    fast_sig = (db_sig, wal_sig, rt_sig, ui_sig)
+    meta_sig = (db_sig[0] if db_sig else None, rt_sig, ui_sig)
+    cache_key = (str(codex_db_path), str(usage_index.path))
+
+    cached = _lru_get(_CODEX_FLOWS_CACHE, cache_key) if use_cache else _MISSING
+    if cached is not _MISSING:
+        c_fast_sig, c_meta_sig, c_watermark, c_flows = cached
+        if c_fast_sig == fast_sig:
+            return c_flows
+
     rows: list[dict[str, Any]] = []
     parents: dict[str, dict[str, Any]] = {}
     con: sqlite3.Connection | None = None
+    watermark: tuple[int, str] = (0, "")
     try:
         uri = f"file:{codex_db_path}?mode=ro"
         con = sqlite3.connect(uri, uri=True, timeout=1.0)
@@ -605,6 +774,17 @@ def _discover_codex_flows(
         if not cols:
             return []
 
+        upd_col = "updated_at_ms" if "updated_at_ms" in cols else ("updated_at" if "updated_at" in cols else None)
+        upd_expr = f"COALESCE(MAX({upd_col}), '')" if upd_col else "''"
+        wm_row = con.execute(f"SELECT COUNT(*), {upd_expr} FROM threads").fetchone()
+        watermark = (int(wm_row[0] or 0), str(wm_row[1] or "")) if wm_row else (0, "")
+
+        if cached is not _MISSING:
+            _, c_meta_sig, c_watermark, c_flows = cached
+            if c_meta_sig == meta_sig and c_watermark == watermark:
+                _lru_set(_CODEX_FLOWS_CACHE, cache_key, (fast_sig, meta_sig, watermark, c_flows), _FLOWS_CACHE_MAX)
+                return c_flows
+
         where_parts: list[str] = []
         if "agent_nickname" in cols:
             where_parts.append("agent_nickname IS NOT NULL")
@@ -613,11 +793,15 @@ def _discover_codex_flows(
         if "source" in cols:
             where_parts.append("source LIKE '%subagent%'")
         if not where_parts:
+            if use_cache:
+                _lru_set(_CODEX_FLOWS_CACHE, cache_key, (fast_sig, meta_sig, watermark, []), _FLOWS_CACHE_MAX)
             return []
 
         query = f"SELECT * FROM threads WHERE {' OR '.join(where_parts)}"
         rows = [dict(r) for r in con.execute(query).fetchall()]
         if not rows:
+            if use_cache:
+                _lru_set(_CODEX_FLOWS_CACHE, cache_key, (fast_sig, meta_sig, watermark, []), _FLOWS_CACHE_MAX)
             return []
 
         parent_ids = {
@@ -763,6 +947,9 @@ def _discover_codex_flows(
             )
         )
 
+    if use_cache:
+        _lru_set(_CODEX_FLOWS_CACHE, cache_key, (fast_sig, meta_sig, watermark, flows), _FLOWS_CACHE_MAX)
+
     return flows
 
 
@@ -771,151 +958,260 @@ def _discover_codex_flows(
 # ---------------------------------------------------------------------------
 
 
+def _scan_claude_subagent_files(projects_dir: Path) -> list[Path]:
+    """Scan ~/.claude/projects/*/subagents/agent-*.jsonl and */*/subagents/agent-*.jsonl via os.scandir."""
+    out: list[Path] = []
+    if not projects_dir.is_dir():
+        return out
+    try:
+        with os.scandir(projects_dir) as proj_it:
+            proj_entries = [e for e in proj_it if e.is_dir()]
+    except OSError:
+        return out
+
+    for p_entry in proj_entries:
+        sub_dir = os.path.join(p_entry.path, "subagents")
+        if os.path.isdir(sub_dir):
+            try:
+                with os.scandir(sub_dir) as sub_it:
+                    for sf in sub_it:
+                        if sf.name.startswith("agent-") and sf.name.endswith(".jsonl") and sf.is_file():
+                            out.append(Path(sf.path))
+            except OSError:
+                pass
+        try:
+            with os.scandir(p_entry.path) as child_it:
+                child_dirs = [e for e in child_it if e.is_dir() and e.name != "subagents"]
+        except OSError:
+            continue
+        for c_entry in child_dirs:
+            sub_dir2 = os.path.join(c_entry.path, "subagents")
+            if not os.path.isdir(sub_dir2):
+                continue
+            try:
+                with os.scandir(sub_dir2) as sub_it2:
+                    for sf in sub_it2:
+                        if sf.name.startswith("agent-") and sf.name.endswith(".jsonl") and sf.is_file():
+                            out.append(Path(sf.path))
+            except OSError:
+                continue
+    out.sort()
+    return out
+
+
 def _discover_claude_flows(
     claude_root: Path,
     *,
     rate_table: RateTable,
     usage_index: UsageIndex,
     now_ts: float,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     if not claude_root.is_dir():
         return []
 
-    flows: list[dict[str, Any]] = []
-
-    # 3a. Claude teams: ~/.claude/teams/*/config.json + ~/.claude/tasks/*/*.json
     teams_dir = claude_root / "teams"
     tasks_root = claude_root / "tasks"
+    projects_dir = claude_root / "projects"
+
+    team_configs: list[Path] = []
+    team_sigs: list[Any] = []
     if teams_dir.is_dir():
         try:
-            team_configs = sorted(teams_dir.glob("*/config.json"))
+            with os.scandir(teams_dir) as t_it:
+                t_entries = sorted((e for e in t_it if e.is_dir()), key=lambda e: e.name)
+            for t_entry in t_entries:
+                cfg_path = Path(t_entry.path) / "config.json"
+                if cfg_path.is_file():
+                    team_configs.append(cfg_path)
+                    if use_cache:
+                        tdir = tasks_root / t_entry.name
+                        t_task_sigs: list[Any] = []
+                        if tdir.is_dir():
+                            try:
+                                with os.scandir(tdir) as tf_it:
+                                    t_task_sigs = sorted(
+                                        (tf.name, _stat_sig(tf.path))
+                                        for tf in tf_it
+                                        if tf.name.endswith(".json") and tf.is_file()
+                                    )
+                            except OSError:
+                                t_task_sigs = []
+                        team_sigs.append((t_entry.name, _stat_sig(cfg_path), tuple(t_task_sigs)))
         except OSError:
             team_configs = []
-        for cfg_path in team_configs:
-            cfg = _safe_json_load(cfg_path)
-            if not isinstance(cfg, dict):
-                continue
-            team_name = str(cfg.get("name") or cfg_path.parent.name).strip()
-            members = cfg.get("members") if isinstance(cfg.get("members"), list) else []
 
-            # Load optional tasks for this team.
-            team_tasks: list[dict[str, Any]] = []
-            tdir = tasks_root / team_name
-            if tdir.is_dir():
-                try:
-                    for tf in sorted(tdir.glob("*.json")):
-                        td = _safe_json_load(tf)
-                        if isinstance(td, dict):
-                            team_tasks.append(td)
-                except OSError:
-                    pass
+    subagent_files = _scan_claude_subagent_files(projects_dir)
+    rt_sig = rate_table.cache_signature()
+    ui_sig = _stat_ino_sig(usage_index.path)
+    cache_key = (str(claude_root), rt_sig, str(usage_index.path))
+    if use_cache:
+        sub_sigs = tuple((str(sf), _stat_sig(sf)) for sf in subagent_files)
+        claude_sig = (tuple(team_sigs), sub_sigs, rt_sig, ui_sig)
+        cached = _lru_get(_CLAUDE_FLOWS_CACHE, cache_key)
+        if cached is not _MISSING:
+            c_sig, c_running_mtimes, c_flows = cached
+            if c_sig == claude_sig and not any(
+                rm is None or (now_ts - rm) > CLAUDE_STALE_THRESHOLD_S
+                for rm in c_running_mtimes
+            ):
+                return _refresh_running_durations(c_flows, now_ts)
+    else:
+        claude_sig = None
 
-            agents: list[dict[str, Any]] = []
-            starts: list[float] = []
-            cwd = str(cfg.get("cwd") or "").strip() or None
-            member_ids = {
-                str(m.get("agentId") or m.get("name") or "").strip()
-                for m in members
-                if isinstance(m, dict)
-            }
-            member_ids.discard("")
-            lead_id = str(cfg.get("leadAgentId") or "").strip() or None
-            for m in members:
-                if not isinstance(m, dict):
-                    continue
-                m_id = str(m.get("agentId") or m.get("name") or "").strip()
-                if not m_id:
-                    continue
-                m_name = str(m.get("name") or m_id)
-                m_model = str(m.get("model") or "claude").strip()
-                sid = str(m.get("sessionId") or m_id).strip()
-                joined_ts = parse_iso_ts(m.get("joinedAt") or cfg.get("createdAt"))
-                if joined_ts is not None:
-                    starts.append(joined_ts)
+    flows: list[dict[str, Any]] = []
+    running_team_mtimes: list[float | None] = []
 
-                u_rec = usage_index.get(sid)
-                tokens = (
-                    {"in": u_rec["in"], "cache": u_rec["cache"], "out": u_rec["out"]}
-                    if u_rec
-                    else None
-                )
-                cost_usd = u_rec.get("costUsd") if u_rec else None
-                if cost_usd is None and tokens is not None:
-                    cost_usd = rate_table.estimate_cost_usd(m_model, tokens)
+    # 3a. Claude teams: ~/.claude/teams/*/config.json + ~/.claude/tasks/*/*.json
+    for cfg_path in team_configs:
+        cfg = _safe_json_load(cfg_path)
+        if not isinstance(cfg, dict):
+            continue
+        team_name = str(cfg.get("name") or cfg_path.parent.name).strip()
+        members = cfg.get("members") if isinstance(cfg.get("members"), list) else []
 
-                links = []
-                slink = make_session_link("claude", sid)
-                if slink:
-                    links.append(slink)
+        cfg_mtime = _safe_mtime(cfg_path)
+        team_mtimes: list[float] = [cfg_mtime] if cfg_mtime is not None else []
 
-                m_tasks = [t for t in team_tasks if t.get("owner") == m_name]
-                raw_last_task = m_tasks[-1].get("subject") if m_tasks else None
-                raw_task_desc = m_tasks[-1].get("description") if m_tasks else None
-                last_task = _truncate(raw_last_task, 160)
-                parent_id = (
-                    lead_id
-                    if (
-                        m.get("agentType") != "team-lead"
-                        and lead_id
-                        and lead_id in member_ids
-                        and lead_id != m_id
-                    )
-                    else None
-                )
-
-                agent = make_agent(
-                    m_id,
-                    m_name,
-                    parent=parent_id,
-                    role=str(m.get("agentType") or "worker"),
-                    lab="anthropic",
-                    model=m_model,
-                    provider="anthropic",
-                    state=normalize_state(m.get("status") or "done"),
-                    started_at=to_iso_utc(joined_ts),
-                    tokens=tokens,
-                    cost_usd=cost_usd,
-                    last=last_task,
-                    links=links,
-                )
-                if u_rec and tokens is not None and u_rec.get("cacheRead") is not None:
-                    agent["cacheRead"] = u_rec["cacheRead"]
-                agent["_labelHint"] = {
-                    "prompt": _bound_hint(raw_task_desc, 360),
-                    "slug": _bound_hint(m.get("agentType"), 400),
-                    "planTask": _bound_hint(raw_last_task, 400),
-                    "rawTitle": _bound_hint(m_name, 400),
-                }
-                agents.append(agent)
-
+        # Load optional tasks for this team.
+        team_tasks: list[dict[str, Any]] = []
+        tdir = tasks_root / team_name
+        if tdir.is_dir():
             try:
-                cfg_mtime = cfg_path.stat().st_mtime
+                with os.scandir(tdir) as tf_it:
+                    tfiles = sorted(
+                        (Path(tf.path) for tf in tf_it if tf.name.endswith(".json") and tf.is_file()),
+                        key=lambda p: p.name,
+                    )
+                for tf in tfiles:
+                    tm = _safe_mtime(tf)
+                    if tm is not None:
+                        team_mtimes.append(tm)
+                    td = _safe_json_load(tf)
+                    if isinstance(td, dict):
+                        team_tasks.append(td)
             except OSError:
-                cfg_mtime = None
+                pass
 
-            flows.append(
-                make_flow(
-                    f"claude-team:{team_name}",
-                    str(cfg.get("description") or team_name),
-                    project_root=cwd,
-                    harness="claude",
-                    kind="swarm",
-                    started_at=to_iso_utc(min(starts)) if starts else to_iso_utc(cfg_mtime),
-                    updated_at=to_iso_utc(cfg_mtime),
-                    goal=str(cfg.get("description") or "") or None,
-                    agents=agents,
+        team_latest_mtime = max(team_mtimes) if team_mtimes else None
+
+        agents: list[dict[str, Any]] = []
+        starts: list[float] = []
+        cwd = str(cfg.get("cwd") or "").strip() or None
+        member_ids = {
+            str(m.get("agentId") or m.get("name") or "").strip()
+            for m in members
+            if isinstance(m, dict)
+        }
+        member_ids.discard("")
+        lead_id = str(cfg.get("leadAgentId") or "").strip() or None
+        for m in members:
+            if not isinstance(m, dict):
+                continue
+            m_id = str(m.get("agentId") or m.get("name") or "").strip()
+            if not m_id:
+                continue
+            m_name = str(m.get("name") or m_id)
+            m_model = str(m.get("model") or "claude").strip()
+            sid = str(m.get("sessionId") or m_id).strip()
+            joined_ts = parse_iso_ts(m.get("joinedAt") or cfg.get("createdAt"))
+            if joined_ts is not None:
+                starts.append(joined_ts)
+
+            u_rec = usage_index.get(sid)
+            tokens = (
+                {"in": u_rec["in"], "cache": u_rec["cache"], "out": u_rec["out"]}
+                if u_rec
+                else None
+            )
+            cost_usd = u_rec.get("costUsd") if u_rec else None
+            if cost_usd is None and tokens is not None:
+                cost_usd = rate_table.estimate_cost_usd(
+                    m_model,
+                    tokens,
+                    cache_read=u_rec.get("cacheRead") if u_rec else None,
+                    cache_write=u_rec.get("cacheWrite") if u_rec else None,
                 )
+
+            links = []
+            slink = make_session_link("claude", sid)
+            if slink:
+                links.append(slink)
+
+            m_tasks = [t for t in team_tasks if t.get("owner") == m_name]
+            raw_last_task = m_tasks[-1].get("subject") if m_tasks else None
+            raw_task_desc = m_tasks[-1].get("description") if m_tasks else None
+            last_task = _truncate(raw_last_task, 160)
+            parent_id = (
+                lead_id
+                if (
+                    m.get("agentType") != "team-lead"
+                    and lead_id
+                    and lead_id in member_ids
+                    and lead_id != m_id
+                )
+                else None
             )
 
+            m_state = normalize_state(m.get("status") or "done")
+            if m_state in ("running", "waiting", "queued") and (
+                team_latest_mtime is None or (now_ts - team_latest_mtime) > CLAUDE_STALE_THRESHOLD_S
+            ):
+                m_state = "stale"
+            if m_state in ("running", "waiting", "queued"):
+                running_team_mtimes.append(team_latest_mtime)
+
+            s_iso = to_iso_utc(joined_ts)
+            dur_s = compute_dur_s(
+                s_iso,
+                None if m_state == "running" else to_iso_utc(team_latest_mtime),
+                is_running=(m_state == "running"),
+                now_ts=now_ts,
+            )
+
+            agent = make_agent(
+                m_id,
+                m_name,
+                parent=parent_id,
+                role=str(m.get("agentType") or "worker"),
+                lab="anthropic",
+                model=m_model,
+                provider="anthropic",
+                state=m_state,
+                started_at=s_iso,
+                ended_at=None if m_state == "running" else to_iso_utc(team_latest_mtime),
+                dur_s=dur_s,
+                tokens=tokens,
+                cost_usd=cost_usd,
+                last=last_task,
+                links=links,
+            )
+            if u_rec and tokens is not None and u_rec.get("cacheRead") is not None:
+                agent["cacheRead"] = u_rec["cacheRead"]
+            agent["_labelHint"] = {
+                "prompt": _bound_hint(raw_task_desc, 360),
+                "slug": _bound_hint(m.get("agentType"), 400),
+                "planTask": _bound_hint(raw_last_task, 400),
+                "rawTitle": _bound_hint(m_name, 400),
+            }
+            agents.append(agent)
+
+        flows.append(
+            make_flow(
+                f"claude-team:{team_name}",
+                str(cfg.get("description") or team_name),
+                project_root=cwd,
+                harness="claude",
+                kind="swarm",
+                started_at=to_iso_utc(min(starts)) if starts else to_iso_utc(cfg_mtime),
+                updated_at=to_iso_utc(team_latest_mtime or cfg_mtime),
+                goal=str(cfg.get("description") or "") or None,
+                agents=agents,
+            )
+        )
+
     # 3b. Claude subagent JSONLs: ~/.claude/projects/**/subagents/agent-*.jsonl
-    projects_dir = claude_root / "projects"
-    if projects_dir.is_dir():
-        subagent_files: list[Path] = []
-        try:
-            subagent_files.extend(sorted(projects_dir.glob("*/subagents/agent-*.jsonl")))
-            subagent_files.extend(sorted(projects_dir.glob("*/*/subagents/agent-*.jsonl")))
-        except OSError:
-            subagent_files = []
+    if subagent_files:
 
         grouped: dict[str, list[Path]] = {}
         for sf in subagent_files:
@@ -1077,6 +1373,9 @@ def _discover_claude_flows(
                     )
                 )
 
+    if use_cache and claude_sig is not None:
+        _lru_set(_CLAUDE_FLOWS_CACHE, cache_key, (claude_sig, running_team_mtimes, flows), _FLOWS_CACHE_MAX)
+
     return flows
 
 
@@ -1207,21 +1506,41 @@ def _normalize_dropin_flow(raw: dict[str, Any], path: Path) -> dict[str, Any] | 
     )
 
 
-def _discover_dropin_flows(dropin_dir: Path) -> list[dict[str, Any]]:
+def _discover_dropin_flows(
+    dropin_dir: Path,
+    *,
+    now_ts: float,
+    use_cache: bool = True,
+) -> list[dict[str, Any]]:
     if not dropin_dir.is_dir():
         return []
-    flows: list[dict[str, Any]] = []
     try:
-        json_files = sorted(dropin_dir.glob("*.json"))
+        with os.scandir(dropin_dir) as it:
+            entries = sorted(
+                (e for e in it if e.name.endswith(".json") and e.is_file()),
+                key=lambda e: e.name,
+            )
     except OSError:
         return []
-    for jf in json_files:
+
+    dir_sig = tuple((e.name, _stat_ino_sig(e.path)) for e in entries) if use_cache else None
+    cache_key = str(dropin_dir)
+    if use_cache and dir_sig is not None:
+        cached = _lru_get(_DROPIN_FLOWS_CACHE, cache_key)
+        if cached is not _MISSING and cached[0] == dir_sig:
+            return _refresh_running_durations(cached[1], now_ts)
+
+    flows: list[dict[str, Any]] = []
+    for entry in entries:
+        jf = Path(entry.path)
         raw = _safe_json_load(jf)
         if not isinstance(raw, dict):
             continue
         flow = _normalize_dropin_flow(raw, jf)
         if flow is not None:
             flows.append(flow)
+    if use_cache and dir_sig is not None:
+        _lru_set(_DROPIN_FLOWS_CACHE, cache_key, (dir_sig, flows), _FLOWS_CACHE_MAX)
     return flows
 
 
@@ -1244,6 +1563,7 @@ def discover_cli_flows(
     home = Path.home()
     rt = rate_table if rate_table is not None else _DEFAULT_RATE_TABLE
     ui = usage_index if usage_index is not None else _DEFAULT_USAGE_INDEX
+    use_cache = now_ts is None
     now = now_ts if now_ts is not None else time.time()
 
     g_root = grok_sessions_root if grok_sessions_root is not None else home / ".grok" / "sessions"
@@ -1256,10 +1576,10 @@ def discover_cli_flows(
         d_dir = Path(env_dropin) if env_dropin else home / ".cache" / "agent-board" / "runs"
 
     flows: list[dict[str, Any]] = []
-    flows.extend(_discover_grok_flows(g_root, rate_table=rt, now_ts=now))
-    flows.extend(_discover_codex_flows(c_db, rate_table=rt, usage_index=ui, now_ts=now))
-    flows.extend(_discover_claude_flows(cl_root, rate_table=rt, usage_index=ui, now_ts=now))
-    flows.extend(_discover_dropin_flows(d_dir))
+    flows.extend(_discover_grok_flows(g_root, rate_table=rt, now_ts=now, use_cache=use_cache))
+    flows.extend(_discover_codex_flows(c_db, rate_table=rt, usage_index=ui, now_ts=now, use_cache=use_cache))
+    flows.extend(_discover_claude_flows(cl_root, rate_table=rt, usage_index=ui, now_ts=now, use_cache=use_cache))
+    flows.extend(_discover_dropin_flows(d_dir, now_ts=now, use_cache=use_cache))
 
     flows.sort(key=lambda f: parse_iso_ts(f.get("updatedAt")) or 0.0, reverse=True)
     return flows

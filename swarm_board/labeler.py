@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Iterable
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -29,9 +30,12 @@ DEFAULT_LABELER_CONFIG: dict[str, Any] = {
 }
 
 _DEFAULT_CONFIG_PATH = Path.home() / ".config" / "swarm-board" / "config.json"
-_CONFIG_FILE_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
-_HEURISTIC_GROUP_CACHE: dict[tuple[Any, ...], tuple[dict[str, str], dict[str, str]]] = {}
+_CONFIG_FILE_CACHE: OrderedDict[str, tuple[int, int, dict[str, Any]]] = OrderedDict()
+_CONFIG_FILE_CACHE_MAX = 32
+_CONFIG_CACHE_LOCK = threading.Lock()
+_HEURISTIC_GROUP_CACHE: OrderedDict[bytes, tuple[dict[str, str], dict[str, str]]] = OrderedDict()
 _HEURISTIC_CACHE_MAX = 1024
+_HEURISTIC_CACHE_LOCK = threading.Lock()
 _LOGGER = logging.getLogger("swarm_board.labeler")
 _MAX_CACHE_ENTRIES = 5000
 _COMPLETED_BATCH_TTL_S = 300.0
@@ -391,15 +395,21 @@ def _read_user_config_file(path: Path | None) -> dict[str, Any]:
     except OSError:
         return {}
     key = str(path)
-    cached = _CONFIG_FILE_CACHE.get(key)
-    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-        return cached[2]
+    with _CONFIG_CACHE_LOCK:
+        cached = _CONFIG_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            _CONFIG_FILE_CACHE.move_to_end(key)
+            return cached[2]
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         data = raw if isinstance(raw, dict) else {}
     except (OSError, ValueError, TypeError):
         data = {}
-    _CONFIG_FILE_CACHE[key] = (st.st_mtime_ns, st.st_size, data)
+    with _CONFIG_CACHE_LOCK:
+        _CONFIG_FILE_CACHE[key] = (st.st_mtime_ns, st.st_size, data)
+        _CONFIG_FILE_CACHE.move_to_end(key)
+        while len(_CONFIG_FILE_CACHE) > _CONFIG_FILE_CACHE_MAX:
+            _CONFIG_FILE_CACHE.popitem(last=False)
     return data
 
 
@@ -506,7 +516,8 @@ def _update_config_file(patch: dict[str, Any], config_path: Path | None = None) 
     lbl.update(patch)
     existing["labeler"] = lbl
     _atomic_write_json(target, existing)
-    _CONFIG_FILE_CACHE.pop(str(target), None)
+    with _CONFIG_CACHE_LOCK:
+        _CONFIG_FILE_CACHE.pop(str(target), None)
     return target
 
 
@@ -611,6 +622,12 @@ class LabelCache:
             except OSError:
                 return 0.0
 
+    def has_entries(self) -> bool:
+        """Return True when the label cache currently holds at least one valid entry."""
+        with self._lock:
+            self._ensure_loaded()
+            return bool(self._entries)
+
     def get(self, key: str) -> dict[str, Any] | None:
         """Lookup a cached label entry by content hash key."""
         if not key:
@@ -619,6 +636,20 @@ class LabelCache:
             self._ensure_loaded()
             item = self._entries.get(key)
             return dict(item) if item is not None else None
+
+    def get_many(self, keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Lookup multiple cached label entries under a single lock/stat pass."""
+        with self._lock:
+            self._ensure_loaded()
+            if not self._entries:
+                return {}
+            out: dict[str, dict[str, Any]] = {}
+            for key in keys:
+                if key:
+                    item = self._entries.get(key)
+                    if item is not None:
+                        out[key] = dict(item)
+            return out
 
     def put_many(self, mapping: dict[str, dict[str, Any]]) -> int:
         """Merge entries and persist atomically to disk. Returns number of entries stored."""
@@ -1463,10 +1494,17 @@ def _derive_sibling_group(
                 str(ag.get("last") or "")[:120],
             )
         )
-    cache_key = (flow_title, flow_goal, tuple(sig_items))
-    cached = _HEURISTIC_GROUP_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    cache_bytes = json.dumps(
+        [flow_title, flow_goal, sig_items],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    cache_key = hashlib.blake2b(cache_bytes, digest_size=16).digest()
+    with _HEURISTIC_CACHE_LOCK:
+        cached = _HEURISTIC_GROUP_CACHE.get(cache_key)
+        if cached is not None:
+            _HEURISTIC_GROUP_CACHE.move_to_end(cache_key)
+            return cached
 
     diff_labels = _cluster_diff_labels(siblings, hints_by_id)
     labels: dict[str, str] = {}
@@ -1477,9 +1515,11 @@ def _derive_sibling_group(
         tasks[aid] = _derive_task(ag, hints_by_id.get(aid) or {}, flow)
     _dedupe_sibling_labels(siblings, labels, hints_by_id)
 
-    if len(_HEURISTIC_GROUP_CACHE) >= _HEURISTIC_CACHE_MAX:
-        _HEURISTIC_GROUP_CACHE.clear()
-    _HEURISTIC_GROUP_CACHE[cache_key] = (labels, tasks)
+    with _HEURISTIC_CACHE_LOCK:
+        _HEURISTIC_GROUP_CACHE[cache_key] = (labels, tasks)
+        _HEURISTIC_GROUP_CACHE.move_to_end(cache_key)
+        while len(_HEURISTIC_GROUP_CACHE) > _HEURISTIC_CACHE_MAX:
+            _HEURISTIC_GROUP_CACHE.popitem(last=False)
     return labels, tasks
 
 
@@ -1644,6 +1684,9 @@ class BackgroundLabeler:
                 expired = [k for k, ts in self._completed_batches.items() if (now - ts) >= _COMPLETED_BATCH_TTL_S]
                 for k in expired:
                     self._completed_batches.pop(k, None)
+                if len(self._completed_batches) > 2048:
+                    keep = sorted(self._completed_batches.items(), key=lambda kv: kv[1], reverse=True)[:1024]
+                    self._completed_batches = dict(keep)
             if bhash in self._queued_batches or bhash in self._completed_batches:
                 return
             if len(self._queue) >= self._max_queue:
@@ -1835,7 +1878,8 @@ def enrich_flow_labels(
     model_spec = f"{cfg['cli']}:{cfg['model']}"
     flow_id = str(flow.get("id") or "")
     flow_title = str(flow.get("title") or "")
-    need_cache_keys = cache is not None or (background is not None and background.enabled)
+    cache_has_entries = cache.has_entries() if cache is not None else False
+    need_cache_keys = cache_has_entries or (background is not None and background.enabled)
 
     # 1. Pop _labelHint from every agent immediately so it can never leak into serialized JSON.
     hints_by_id: dict[str, dict[str, Any]] = {}
@@ -1870,6 +1914,38 @@ def enrich_flow_labels(
                 sibling_sigs[aid] = ssig
 
     # 3. Resolve cache hits & apply labels/tasks without mutating nested dicts.
+    ckeys_by_id: dict[str, str] = {}
+    prompt_heads_by_id: dict[str, str] = {}
+    raw_names_by_id: dict[str, str] = {}
+    if need_cache_keys:
+        for ag in agents:
+            if not isinstance(ag, dict):
+                continue
+            aid = str(ag.get("id") or "")
+            if aid in explicit_ids:
+                continue
+            role = str(ag.get("role") or "worker").lower()
+            if role in ("root", "coordinator"):
+                continue
+            hint = hints_by_id.get(aid) or {}
+            raw_name = str(hint.get("rawTitle") or ag.get("name") or "")
+            prompt_head = str(hint.get("prompt") or ag.get("brief") or hint.get("planTask") or "")[:400]
+            raw_names_by_id[aid] = raw_name
+            prompt_heads_by_id[aid] = prompt_head
+            ckeys_by_id[aid] = make_cache_key(
+                model_spec,
+                aid,
+                raw_name,
+                prompt_head,
+                sibling_sigs.get(aid, ""),
+            )
+
+    cached_by_key = (
+        cache.get_many(ckeys_by_id.values())
+        if (cache is not None and cache_has_entries and ckeys_by_id)
+        else {}
+    )
+
     batch_items: list[dict[str, Any]] = []
     llm_applied_ids: set[str] = set()
 
@@ -1879,8 +1955,6 @@ def enrich_flow_labels(
         aid = str(ag.get("id") or "")
         role = str(ag.get("role") or "worker").lower()
         hint = hints_by_id.get(aid) or {}
-        raw_name = str(hint.get("rawTitle") or ag.get("name") or "")
-        prompt_head = str(hint.get("prompt") or ag.get("brief") or hint.get("planTask") or "")[:400]
 
         if aid in explicit_ids:
             ag["label"] = sanitize_label(str(ag["label"]))
@@ -1889,12 +1963,8 @@ def enrich_flow_labels(
             ag["labelSource"] = "explicit"
             continue
 
-        ckey = (
-            make_cache_key(model_spec, aid, raw_name, prompt_head, sibling_sigs.get(aid, ""))
-            if need_cache_keys and role not in ("root", "coordinator")
-            else ""
-        )
-        cached = cache.get(ckey) if (cache is not None and ckey) else None
+        ckey = ckeys_by_id.get(aid, "")
+        cached = cached_by_key.get(ckey) if ckey else None
         if cached is not None:
             ag["label"] = sanitize_label(str(cached["label"]))
             ag["task"] = sanitize_task(str(cached["task"]))
@@ -1910,9 +1980,9 @@ def enrich_flow_labels(
                         "agentId": aid,
                         "parent": ag.get("parent"),
                         "role": role,
-                        "rawName": raw_name,
+                        "rawName": raw_names_by_id.get(aid, ""),
                         "slug": str(hint.get("slug") or ""),
-                        "promptHead": prompt_head,
+                        "promptHead": prompt_heads_by_id.get(aid, ""),
                         "cacheKey": ckey,
                     }
                 )

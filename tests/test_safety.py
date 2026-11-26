@@ -113,6 +113,28 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(cmiss["ok"])
         self.assertIn("Not found", cmiss["error"])
 
+    def test_blocks_nul_byte_paths(self) -> None:
+        bad = "src/main.py\x00.txt"
+        reason = redact_if_secret_name(bad)
+        self.assertIsNotNone(reason)
+        self.assertIn("null byte", (reason or "").lower())
+
+        ok, err = is_path_allowed(str(self.root / bad), [str(self.root)])
+        self.assertFalse(ok)
+        self.assertIn("null byte", (err or "").lower())
+
+        abs_bad = str(self.root / bad)
+        res_txt_abs = safe_read_text(abs_bad, [str(self.root)])
+        self.assertFalse(res_txt_abs["ok"])
+        self.assertIn("null byte", (res_txt_abs.get("error") or "").lower())
+
+        res_cit_abs = safe_read_citation_lines(abs_bad, 1, [str(self.root)])
+        self.assertFalse(res_cit_abs["ok"])
+        self.assertIn("null byte", (res_cit_abs.get("error") or "").lower())
+
+        self.assertFalse(safe_read_text(bad, [str(self.root)])["ok"])
+        self.assertFalse(safe_read_citation_lines(bad, 1, [str(self.root)])["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
 import glob
 import json
 import os
@@ -31,6 +31,13 @@ from swarm_board.schema import (
 INLINE_TEXT_MAX_BYTES = 65_536
 STALE_THRESHOLD_S = 600.0
 HELPER_ROLES = frozenset({"narrator", "monitor"})
+_TERMINAL_STATES = frozenset({"killed", "done", "error", "interrupted", "stale"})
+_MISSING = object()
+_TRANSCRIPT_CACHE_MAX = 256
+_BOARD_CACHE_MAX = 128
+_PROJECT_ROOT_CACHE_MAX = 512
+_INLINE_FILE_CACHE_MAX = 256
+_SWARM_FLOW_CACHE_MAX = 128
 
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([a-zA-Z0-9][a-zA-Z0-9_-]*)")
 _SEQ_REF_RE = re.compile(r"(?<![A-Za-z0-9_])#(\d+)\b")
@@ -78,22 +85,29 @@ _PROJECT_MARKERS = (
     "Makefile",
 )
 
-# In-memory mtime:size caches so unchanged multi-MB transcripts/boards are never re-parsed.
-_TRANSCRIPT_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
-_BOARD_CACHE: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
-_PROJECT_ROOT_CACHE: dict[str, str | None] = {}
-_INLINE_FILE_CACHE: dict[str, tuple[int, int, str | None]] = {}
-_SWARM_FLOW_CACHE: dict[
-    str,
-    tuple[
-        tuple[Any, ...],
-        list[tuple[str, tuple[int, int] | None]],
-        list[tuple[str, tuple[int, int] | None]],
-        dict[str, Any],
-    ],
-] = {}
+# Bounded LRU mtime:size caches so repeated polls stay fast and memory stays flat.
+_TRANSCRIPT_CACHE: OrderedDict[str, tuple[int, int, dict[str, Any]]] = OrderedDict()
+_BOARD_CACHE: OrderedDict[str, tuple[int, int, list[dict[str, Any]]]] = OrderedDict()
+_PROJECT_ROOT_CACHE: OrderedDict[str, str | None] = OrderedDict()
+_INLINE_FILE_CACHE: OrderedDict[str, tuple[int, int, str | None]] = OrderedDict()
+_SWARM_FLOW_CACHE: OrderedDict[str, tuple[Any, ...]] = OrderedDict()
 _DEFAULT_RATE_TABLE = RateTable()
 _DEFAULT_USAGE_INDEX = UsageIndex()
+
+
+def _lru_get(cache: OrderedDict[Any, Any], key: Any) -> Any:
+    val = cache.get(key, _MISSING)
+    if val is not _MISSING:
+        cache.move_to_end(key)
+    return val
+
+
+def _lru_set(cache: OrderedDict[Any, Any], key: Any, val: Any, max_size: int) -> None:
+    if key in cache:
+        cache.move_to_end(key)
+    cache[key] = val
+    while len(cache) > max_size:
+        cache.popitem(last=False)
 
 
 def default_brain_roots() -> list[Path]:
@@ -222,8 +236,9 @@ def _find_project_root_for_path(path_str: str) -> str | None:
     p = Path(path_str)
     cur = p if p.is_dir() else p.parent
     start_key = str(cur)
-    if start_key in _PROJECT_ROOT_CACHE:
-        return _PROJECT_ROOT_CACHE[start_key]
+    cached_root = _lru_get(_PROJECT_ROOT_CACHE, start_key)
+    if cached_root is not _MISSING:
+        return cached_root
     home_str = str(Path.home())
     # Walk up looking for a project marker, stopping before $HOME or filesystem root.
     found: str | None = None
@@ -237,7 +252,7 @@ def _find_project_root_for_path(path_str: str) -> str | None:
         if cur.parent == cur:
             break
         cur = cur.parent
-    _PROJECT_ROOT_CACHE[start_key] = found
+    _lru_set(_PROJECT_ROOT_CACHE, start_key, found, _PROJECT_ROOT_CACHE_MAX)
     return found
 
 
@@ -268,8 +283,8 @@ def _parse_board(board_path: Path) -> list[dict[str, Any]]:
         return []
 
     cache_key = str(board_path)
-    cached = _BOARD_CACHE.get(cache_key)
-    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+    cached = _lru_get(_BOARD_CACHE, cache_key)
+    if cached is not _MISSING and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
         return cached[2]
 
     posts: list[dict[str, Any]] = []
@@ -309,7 +324,7 @@ def _parse_board(board_path: Path) -> list[dict[str, Any]]:
     except OSError:
         return []
 
-    _BOARD_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, posts)
+    _lru_set(_BOARD_CACHE, cache_key, (st.st_mtime_ns, st.st_size, posts), _BOARD_CACHE_MAX)
     return posts
 
 
@@ -321,8 +336,8 @@ def _parse_transcript(transcript_path: Path) -> dict[str, Any] | None:
         return None
 
     cache_key = str(transcript_path)
-    cached = _TRANSCRIPT_CACHE.get(cache_key)
-    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+    cached = _lru_get(_TRANSCRIPT_CACHE, cache_key)
+    if cached is not _MISSING and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
         return cached[2]
 
     first_ts: float | None = None
@@ -497,7 +512,7 @@ def _parse_transcript(transcript_path: Path) -> dict[str, Any] | None:
         "last_tool_names": last_tool_names,
         "saw_swarm_wait_done": saw_swarm_wait_done,
     }
-    _TRANSCRIPT_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, summary)
+    _lru_set(_TRANSCRIPT_CACHE, cache_key, (st.st_mtime_ns, st.st_size, summary), _TRANSCRIPT_CACHE_MAX)
     return summary
 
 
@@ -607,8 +622,8 @@ def _maybe_inline_file(resolved: str, size: int, mtime_ns: int | None = None) ->
     if Path(resolved).suffix.lower() in _BINARY_EXTS:
         return None
     if mtime_ns is not None:
-        cached = _INLINE_FILE_CACHE.get(resolved)
-        if cached is not None and cached[0] == mtime_ns and cached[1] == size:
+        cached = _lru_get(_INLINE_FILE_CACHE, resolved)
+        if cached is not _MISSING and cached[0] == mtime_ns and cached[1] == size:
             return cached[2]
     try:
         raw = Path(resolved).read_bytes()
@@ -616,7 +631,7 @@ def _maybe_inline_file(resolved: str, size: int, mtime_ns: int | None = None) ->
         return None
     body: str | None = None if b"\x00" in raw[:4096] else raw.decode("utf-8", errors="replace")
     if mtime_ns is not None:
-        _INLINE_FILE_CACHE[resolved] = (mtime_ns, size, body)
+        _lru_set(_INLINE_FILE_CACHE, resolved, (mtime_ns, size, body), _INLINE_FILE_CACHE_MAX)
     return body
 
 
@@ -725,6 +740,27 @@ def _stat_sig(path: Path | str) -> tuple[int, int] | None:
         return None
 
 
+def _refresh_swarm_flow(
+    flow: dict[str, Any],
+    running_mtimes: dict[str, float | None],
+    now_ts: float,
+) -> dict[str, Any]:
+    if not running_mtimes:
+        return flow
+    agents = flow.get("agents") or ()
+    new_agents = []
+    for a in agents:
+        if isinstance(a, dict) and a.get("state") == "running":
+            a_copy = dict(a)
+            a_copy["durS"] = compute_dur_s(a.get("startedAt"), None, is_running=True, now_ts=now_ts)
+            new_agents.append(a_copy)
+        else:
+            new_agents.append(a)
+    f_copy = dict(flow)
+    f_copy["agents"] = new_agents
+    return f_copy
+
+
 def _build_swarm_flow(
     brain_dir: Path,
     swarm_dir: Path,
@@ -745,15 +781,24 @@ def _build_swarm_flow(
     )
     cache_key = str(swarm_dir)
     if use_cache:
-        cached_entry = _SWARM_FLOW_CACHE.get(cache_key)
-        if cached_entry is not None:
-            c_base_sig, c_tr_sigs, c_out_sigs, c_flow = cached_entry
+        cached_entry = _lru_get(_SWARM_FLOW_CACHE, cache_key)
+        if cached_entry is not _MISSING:
+            c_base_sig, c_tr_sigs, c_out_sigs, c_flow, c_running_mtimes, c_waiting_coords = cached_entry
             if (
                 c_base_sig == base_sig
                 and all(_stat_sig(p) == s for p, s in c_tr_sigs)
                 and all(_stat_sig(p) == s for p, s in c_out_sigs)
             ):
-                return c_flow
+                aged_running = any(
+                    m is not None and (now_ts - m) > STALE_THRESHOLD_S
+                    for m in c_running_mtimes.values()
+                )
+                aged_waiting = any(
+                    (now_ts - c_ts) > STALE_THRESHOLD_S
+                    for c_ts in c_waiting_coords.values()
+                )
+                if not aged_running and not aged_waiting:
+                    return _refresh_swarm_flow(c_flow, c_running_mtimes, now_ts)
 
     conv_id = swarm_dir.parent.parent.name
     swarm_json = _safe_json_load(swarm_dir / "swarm.json")
@@ -964,7 +1009,7 @@ def _build_swarm_flow(
                     size=st.st_size,
                     by=author,
                     at=to_iso_utc(st.st_mtime),
-                    body=_maybe_inline_file(resolved, st.st_size, st.st_mtime_ns),
+                    body=None,
                     meta={"relativePath": rel_title},
                 )
             )
@@ -1155,6 +1200,46 @@ def _build_swarm_flow(
         }
         agents.append(agent)
 
+    # Prevent completed swarms from leaving the coordinator permanently stuck in `waiting`.
+    def _is_coord_or_lead(ag: dict[str, Any]) -> bool:
+        return ag.get("role") in ("coordinator", "lead") or (
+            coord_name is not None and ag.get("id") == coord_name
+        )
+
+    def _is_helper(ag: dict[str, Any]) -> bool:
+        return bool(ag.get("isHelper")) or ag.get("role") in HELPER_ROLES
+
+    non_helper_workers = [ag for ag in agents if not _is_coord_or_lead(ag) and not _is_helper(ag)]
+    all_workers_terminal = bool(non_helper_workers) and all(
+        ag.get("state") in _TERMINAL_STATES for ag in non_helper_workers
+    )
+    waiting_coord_activity: dict[str, float] = {}
+    if all_workers_terminal:
+        for ag in agents:
+            if _is_coord_or_lead(ag) and ag.get("state") == "waiting":
+                aid = str(ag["id"])
+                tr = transcripts_by_member.get(aid)
+                lp = last_post_by_member.get(aid)
+                cands: list[float] = []
+                if tr and tr.get("mtime_s") is not None:
+                    cands.append(float(tr["mtime_s"]))
+                if lp and lp.get("ts") is not None:
+                    cands.append(float(lp["ts"]))
+                latest_coord_ts = max(cands) if cands else members_mtime_s
+                if latest_coord_ts is not None and (now_ts - latest_coord_ts) > STALE_THRESHOLD_S:
+                    ag["state"] = "done"
+                elif latest_coord_ts is not None:
+                    waiting_coord_activity[aid] = latest_coord_ts
+
+    running_mtimes: dict[str, float | None] = {}
+    for ag in agents:
+        if ag.get("state") == "running":
+            aid = str(ag["id"])
+            tr = transcripts_by_member.get(aid)
+            running_mtimes[aid] = (
+                float(tr["mtime_s"]) if (tr and tr.get("mtime_s") is not None) else members_mtime_s
+            )
+
     for p in board_posts:
         if p.get("ts") is not None:
             all_ends.append(p["ts"])
@@ -1188,14 +1273,19 @@ def _build_swarm_flow(
         outputs=outputs,
         links=flow_links,
     )
-    if use_cache and not any(a.get("state") == "running" for a in agents):
+    if use_cache:
         tr_sigs = [(str(tp), _stat_sig(tp)) for tp in transcript_paths.values()]
         out_sigs = [
             (str(o["path"]), _stat_sig(o["path"]))
             for o in outputs
             if isinstance(o.get("path"), str) and o.get("kind") != "transcript"
         ]
-        _SWARM_FLOW_CACHE[cache_key] = (base_sig, tr_sigs, out_sigs, flow)
+        _lru_set(
+            _SWARM_FLOW_CACHE,
+            cache_key,
+            (base_sig, tr_sigs, out_sigs, flow, running_mtimes, waiting_coord_activity),
+            _SWARM_FLOW_CACHE_MAX,
+        )
     return flow
 
 

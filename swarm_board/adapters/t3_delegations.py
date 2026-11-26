@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
 import json
 import os
 from pathlib import Path
@@ -25,6 +25,8 @@ from swarm_board.schema import (
     make_session_link,
     normalize_lab,
     normalize_state,
+    parse_iso_ts,
+    to_iso_utc,
 )
 from .agy_swarms import default_brain_roots as _agy_default_brain_roots
 
@@ -37,23 +39,68 @@ DEFAULT_GROK_SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
 _DEFAULT_RATE_TABLE = RateTable()
 _DEFAULT_USAGE_INDEX = UsageIndex()
 
-# Module-level mtime+size caches so repeated polls stay fast (< 25 ms).
-_TRANSCRIPT_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
-_GROK_USAGE_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
+_TRANSCRIPT_CACHE_MAX = 256
+_GROK_USAGE_CACHE_MAX = 256
+_RESULT_FILES_CACHE_MAX = 256
+_SUBAGENT_RESULT_CACHE_MAX_ENTRIES = 64
+_SUBAGENT_RESULT_CACHE_MAX_BYTES = 256 * 1024
+_MAX_INLINE_RESULT_BYTES = 4_096
+_T3_FLOWS_CACHE_MAX = 32
+_ACTIVE_THREADS_CACHE_MAX = 32
+_ACTIVE_RECENT_WINDOW_S = 172_800.0
+_MISSING = object()
+
+# Bounded LRU mtime+size caches so repeated polls stay fast and memory stays flat.
+_TRANSCRIPT_CACHE: OrderedDict[str, tuple[int, int, dict[str, Any]]] = OrderedDict()
+_GROK_USAGE_CACHE: OrderedDict[str, tuple[int, int, dict[str, Any]]] = OrderedDict()
 _GROK_INDEX_CACHE: tuple[float, str, dict[str, Path]] = (0.0, "", {})
 _BRAIN_INDEX_CACHE: tuple[float, tuple[str, ...], dict[str, Path]] = (0.0, (), {})
-_RESULT_FILES_CACHE: dict[tuple[str, str, tuple[str, ...]], list[dict[str, Any]]] = {}
-_SUBAGENT_RESULT_CACHE: dict[tuple[str, int, str, str], str | None] = {}
-_T3_FLOWS_CACHE: dict[
-    tuple[Any, ...],
-    tuple[
-        tuple[Any, ...],
-        list[tuple[str, tuple[int, int] | None]],
-        list[tuple[str, tuple[int, int] | None]],
-        list[dict[str, Any]],
-    ],
-] = {}
-_RATE_LOOKUP_CACHE: dict[tuple[int, float, str], dict[str, Any] | None] = {}
+_RESULT_FILES_CACHE: OrderedDict[tuple[str, str, tuple[str, ...]], list[dict[str, Any]]] = OrderedDict()
+_SUBAGENT_RESULT_CACHE: OrderedDict[tuple[str, int, str, str], tuple[str | None, int]] = OrderedDict()
+_SUBAGENT_RESULT_CACHE_BYTES: int = 0
+_T3_FLOWS_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+_ACTIVE_THREADS_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
+
+
+def _lru_get(cache: OrderedDict[Any, Any], key: Any) -> Any:
+    val = cache.get(key, _MISSING)
+    if val is not _MISSING:
+        cache.move_to_end(key)
+    return val
+
+
+def _lru_set(cache: OrderedDict[Any, Any], key: Any, val: Any, max_size: int) -> None:
+    if key in cache:
+        cache.move_to_end(key)
+    cache[key] = val
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def _subagent_result_cache_get(key: tuple[str, int, str, str]) -> Any:
+    item = _SUBAGENT_RESULT_CACHE.get(key, _MISSING)
+    if item is _MISSING:
+        return _MISSING
+    _SUBAGENT_RESULT_CACHE.move_to_end(key)
+    return item[0]
+
+
+def _subagent_result_cache_set(key: tuple[str, int, str, str], val: str | None) -> None:
+    global _SUBAGENT_RESULT_CACHE_BYTES
+    vbytes = len(val.encode("utf-8")) if isinstance(val, str) else 0
+    if vbytes > _SUBAGENT_RESULT_CACHE_MAX_BYTES:
+        return
+    old = _SUBAGENT_RESULT_CACHE.pop(key, None)
+    if old is not None:
+        _SUBAGENT_RESULT_CACHE_BYTES = max(0, _SUBAGENT_RESULT_CACHE_BYTES - old[1])
+    while _SUBAGENT_RESULT_CACHE and (
+        len(_SUBAGENT_RESULT_CACHE) >= _SUBAGENT_RESULT_CACHE_MAX_ENTRIES
+        or (_SUBAGENT_RESULT_CACHE_BYTES + vbytes) > _SUBAGENT_RESULT_CACHE_MAX_BYTES
+    ):
+        _, (_, evicted_bytes) = _SUBAGENT_RESULT_CACHE.popitem(last=False)
+        _SUBAGENT_RESULT_CACHE_BYTES = max(0, _SUBAGENT_RESULT_CACHE_BYTES - evicted_bytes)
+    _SUBAGENT_RESULT_CACHE[key] = (val, vbytes)
+    _SUBAGENT_RESULT_CACHE_BYTES += vbytes
 
 _MODEL_COST_ALIASES: dict[str, str] = {
     "gemini-pro-orchestrator-neon": "gemini-4-neon",
@@ -248,8 +295,8 @@ def _parse_agy_transcript(path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
     sig = (st.st_mtime_ns, st.st_size)
-    cached = _TRANSCRIPT_CACHE.get(key)
-    if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+    cached = _lru_get(_TRANSCRIPT_CACHE, key)
+    if cached is not _MISSING and cached[0] == sig[0] and cached[1] == sig[1]:
         return cached[2]
 
     in_tok = 0
@@ -298,7 +345,7 @@ def _parse_agy_transcript(path: Path) -> dict[str, Any] | None:
         "trace": trace,
         "last": last_activity,
     }
-    _TRANSCRIPT_CACHE[key] = (sig[0], sig[1], parsed)
+    _lru_set(_TRANSCRIPT_CACHE, key, (sig[0], sig[1], parsed), _TRANSCRIPT_CACHE_MAX)
     return parsed
 
 
@@ -310,8 +357,8 @@ def _parse_grok_usage(path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
     sig = (st.st_mtime_ns, st.st_size)
-    cached = _GROK_USAGE_CACHE.get(key)
-    if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+    cached = _lru_get(_GROK_USAGE_CACHE, key)
+    if cached is not _MISSING and cached[0] == sig[0] and cached[1] == sig[1]:
         return cached[2]
 
     try:
@@ -340,7 +387,7 @@ def _parse_grok_usage(path: Path) -> dict[str, Any] | None:
         "costUsd": cost_usd,
         "model": model,
     }
-    _GROK_USAGE_CACHE[key] = (sig[0], sig[1], parsed)
+    _lru_set(_GROK_USAGE_CACHE, key, (sig[0], sig[1], parsed), _GROK_USAGE_CACHE_MAX)
     return parsed
 
 
@@ -393,8 +440,8 @@ def _extract_result_files(
         return []
 
     cache_key = (subagent_id, updated_at or "", tuple(allowed_roots))
-    cached = _RESULT_FILES_CACHE.get(cache_key)
-    if cached is not None:
+    cached = _lru_get(_RESULT_FILES_CACHE, cache_key)
+    if cached is not _MISSING:
         return cached
 
     candidates: list[str] = []
@@ -453,7 +500,7 @@ def _extract_result_files(
         )
         if len(outputs) >= _MAX_FILE_OUTPUTS_PER_AGENT:
             break
-    _RESULT_FILES_CACHE[cache_key] = outputs
+    _lru_set(_RESULT_FILES_CACHE, cache_key, outputs, _RESULT_FILES_CACHE_MAX)
     return outputs
 
 
@@ -683,6 +730,225 @@ def _refresh_running_durations(
     return out
 
 
+def _refresh_active_thread_durations(
+    items: list[dict[str, Any]],
+    now_ts: float,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if item.get("isLive"):
+            copy_item = dict(item)
+            copy_item["durS"] = compute_dur_s(
+                copy_item.get("startedAt"),
+                None,
+                is_running=True,
+                now_ts=now_ts,
+            )
+            out.append(copy_item)
+        else:
+            out.append(item)
+    return out
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    try:
+        return {str(r[1]) for r in conn.execute(f"PRAGMA table_info({table_name})")}
+    except sqlite3.Error:
+        return set()
+
+
+def _thread_select_sql(thread_cols: set[str]) -> str:
+    """Build a schema-resilient SELECT projection for orchestration_v2_projection_threads."""
+    parts = [
+        "thread_id",
+        "project_id" if "project_id" in thread_cols else "NULL AS project_id",
+        "title" if "title" in thread_cols else "NULL AS title",
+        "default_provider" if "default_provider" in thread_cols else "NULL AS default_provider",
+        "provider_instance_id" if "provider_instance_id" in thread_cols else "NULL AS provider_instance_id",
+        "active_provider_thread_id" if "active_provider_thread_id" in thread_cols else "NULL AS active_provider_thread_id",
+        "created_at" if "created_at" in thread_cols else "NULL AS created_at",
+        "updated_at" if "updated_at" in thread_cols else "NULL AS updated_at",
+        "archived_at" if "archived_at" in thread_cols else "NULL AS archived_at",
+        "deleted_at" if "deleted_at" in thread_cols else "NULL AS deleted_at",
+    ]
+    if "payload_json" in thread_cols:
+        parts.extend(
+            [
+                "json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id",
+                "json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id",
+                "json_extract(payload_json, '$.lineage.relationshipToParent') AS rel_to_parent",
+                "json_extract(payload_json, '$.modelSelection.model') AS model",
+                "json_extract(payload_json, '$.worktreePath') AS worktree_path",
+                "json_extract(payload_json, '$.settledAt') AS settled_at",
+            ]
+        )
+    else:
+        parts.extend(
+            [
+                "NULL AS root_thread_id",
+                "NULL AS parent_thread_id",
+                "NULL AS rel_to_parent",
+                "NULL AS model",
+                "NULL AS worktree_path",
+                "NULL AS settled_at",
+            ]
+        )
+    return ", ".join(parts)
+
+
+def _fetch_live_runs(
+    conn: sqlite3.Connection,
+    run_cols: set[str],
+) -> tuple[dict[str, dict[str, Any]], tuple[tuple[str, str, str], ...]]:
+    """Fetch live runs and a deterministic watermark tuple."""
+    if "thread_id" not in run_cols or "status" not in run_cols:
+        return {}, ()
+    run_id_expr = "run_id" if "run_id" in run_cols else "CAST(rowid AS TEXT) AS run_id"
+    req_expr = "requested_at" if "requested_at" in run_cols else "NULL AS requested_at"
+    rows = conn.execute(
+        f"""
+        SELECT {run_id_expr}, thread_id, status, {req_expr}
+        FROM orchestration_v2_projection_runs
+        WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+        ORDER BY thread_id ASC, run_id ASC
+        """
+    ).fetchall()
+    live_info: dict[str, dict[str, Any]] = {}
+    sig_items: list[tuple[str, str, str]] = []
+    for r in rows:
+        tid = str(r["thread_id"] or "")
+        st = str(r["status"] or "")
+        rid = str(r["run_id"] or "")
+        sig_items.append((tid, st, rid))
+        if tid and (tid not in live_info or st == "running"):
+            live_info[tid] = {
+                "status": st,
+                "run_id": rid,
+                "requested_at": r["requested_at"],
+            }
+    return live_info, tuple(sig_items)
+
+
+def _query_subagent_watermark(conn: sqlite3.Connection, sub_cols: set[str]) -> tuple[int, str]:
+    if not sub_cols:
+        return (0, "")
+    upd_expr = "COALESCE(MAX(updated_at), '')" if "updated_at" in sub_cols else "''"
+    row = conn.execute(
+        f"SELECT COUNT(*), {upd_expr} FROM orchestration_v2_projection_subagents"
+    ).fetchone()
+    return (int(row[0] or 0), str(row[1] or "")) if row else (0, "")
+
+
+def _query_roots_watermark(
+    conn: sqlite3.Connection,
+    thread_cols: set[str],
+    root_ids: tuple[str, ...],
+) -> tuple[int, str, int, int]:
+    if not root_ids or "thread_id" not in thread_cols:
+        return (0, "", 0, 0)
+    upd_expr = "COALESCE(MAX(updated_at), '')" if "updated_at" in thread_cols else "''"
+    del_expr = "SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END)" if "deleted_at" in thread_cols else "0"
+    arch_expr = "SUM(CASE WHEN archived_at IS NOT NULL THEN 1 ELSE 0 END)" if "archived_at" in thread_cols else "0"
+    total_cnt = 0
+    max_upd = ""
+    del_cnt = 0
+    arch_cnt = 0
+    for i in range(0, len(root_ids), 400):
+        chunk = root_ids[i : i + 400]
+        ph = ",".join("?" * len(chunk))
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*), {upd_expr}, {del_expr}, {arch_expr}
+            FROM orchestration_v2_projection_threads
+            WHERE thread_id IN ({ph})
+            """,
+            chunk,
+        ).fetchone()
+        if row:
+            total_cnt += int(row[0] or 0)
+            upd = str(row[1] or "")
+            if upd > max_upd:
+                max_upd = upd
+            del_cnt += int(row[2] or 0)
+            arch_cnt += int(row[3] or 0)
+    return (total_cnt, max_upd, del_cnt, arch_cnt)
+
+
+def _compute_roots_watermark_from_map(
+    threads_by_id: dict[str, dict[str, Any]],
+    thread_cols: set[str],
+    root_ids: tuple[str, ...],
+) -> tuple[int, str, int, int]:
+    if not root_ids or "thread_id" not in thread_cols:
+        return (0, "", 0, 0)
+    has_upd = "updated_at" in thread_cols
+    has_del = "deleted_at" in thread_cols
+    has_arch = "archived_at" in thread_cols
+    total_cnt = 0
+    max_upd = ""
+    del_cnt = 0
+    arch_cnt = 0
+    for rtid in root_ids:
+        t = threads_by_id.get(rtid)
+        if t is None:
+            continue
+        total_cnt += 1
+        if has_upd:
+            upd = str(t.get("updated_at") or "")
+            if upd > max_upd:
+                max_upd = upd
+        if has_del and t.get("deleted_at") is not None:
+            del_cnt += 1
+        if has_arch and t.get("archived_at") is not None:
+            arch_cnt += 1
+    return (total_cnt, max_upd, del_cnt, arch_cnt)
+
+
+def _query_active_threads_watermark(
+    conn: sqlite3.Connection,
+    thread_cols: set[str],
+) -> tuple[int, str]:
+    if not thread_cols:
+        return (0, "")
+    where_parts = []
+    if "deleted_at" in thread_cols:
+        where_parts.append("deleted_at IS NULL")
+    if "archived_at" in thread_cols:
+        where_parts.append("archived_at IS NULL")
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    upd_expr = "COALESCE(MAX(updated_at), '')" if "updated_at" in thread_cols else "''"
+    row = conn.execute(
+        f"SELECT COUNT(*), {upd_expr} FROM orchestration_v2_projection_threads {where_sql}"
+    ).fetchone()
+    return (int(row[0] or 0), str(row[1] or "")) if row else (0, "")
+
+
+def _collect_t3_cache_sigs(
+    flows: list[dict[str, Any]],
+    grok_map: dict[str, Path],
+) -> tuple[list[tuple[str, tuple[int, int] | None]], list[tuple[str, tuple[int, int] | None]]]:
+    tr_sigs: list[tuple[str, tuple[int, int] | None]] = []
+    seen_tr: set[str] = set()
+    grok_sigs: list[tuple[str, tuple[int, int] | None]] = []
+    seen_grok: set[str] = set()
+    for f in flows:
+        for o in f.get("outputs") or ():
+            if not isinstance(o, dict):
+                continue
+            if o.get("kind") == "transcript" and isinstance(o.get("path"), str):
+                trp = o["path"]
+                if trp not in seen_tr:
+                    seen_tr.add(trp)
+                    tr_sigs.append((trp, _stat_mtime_size(trp)))
+            nid = (o.get("meta") or {}).get("nativeId")
+            if isinstance(nid, str) and nid in grok_map:
+                gp = str(grok_map[nid])
+                if gp not in seen_grok:
+                    seen_grok.add(gp)
+                    grok_sigs.append((gp, _stat_mtime_size(gp)))
+    return tr_sigs, grok_sigs
+
+
 def discover_t3_flows(
     db_path: Path | None = None,
     *,
@@ -694,7 +960,7 @@ def discover_t3_flows(
     grok_sessions_root: Path | None = None,
     now_ts: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Discover recent T3 delegation trees as normalized read-only Flow objects."""
+    """Discover recent T3 delegation trees and standalone live threads as normalized Flow objects."""
     resolved_db = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
     if not resolved_db.is_file():
         return []
@@ -706,6 +972,7 @@ def discover_t3_flows(
     g_root = grok_sessions_root if grok_sessions_root is not None else DEFAULT_GROK_SESSIONS_ROOT
 
     use_cache = now_ts is None
+    effective_now = now_ts if now_ts is not None else time.time()
     cache_key = (
         str(resolved_db),
         resolved_env_id,
@@ -716,25 +983,22 @@ def discover_t3_flows(
         tuple(str(p) for p in b_roots),
     )
     wal_path = f"{resolved_db}-wal"
-    sig = (
-        _stat_ino_sig(resolved_db),
-        _stat_ino_sig(wal_path),
-        rt.cache_signature(),
-        _stat_ino_sig(ui.path),
-    )
-    if use_cache:
-        cached = _T3_FLOWS_CACHE.get(cache_key)
-        if cached is not None:
-            c_sig, c_tr_sigs, c_grok_sigs, c_flows = cached
-            if (
-                c_sig == sig
-                and all(_stat_mtime_size(p) == s for p, s in c_tr_sigs)
-                and all(_stat_mtime_size(p) == s for p, s in c_grok_sigs)
-            ):
-                return _refresh_running_durations(c_flows, time.time())
+    db_sig = _stat_ino_sig(resolved_db)
+    wal_sig = _stat_ino_sig(wal_path)
+    rt_sig = rt.cache_signature()
+    ui_sig = _stat_ino_sig(ui.path)
+    fast_sig = (db_sig, wal_sig, rt_sig, ui_sig)
+    meta_sig = (db_sig[0] if db_sig else None, rt_sig, ui_sig)
 
-    brain_map = _get_brain_transcript_map(b_roots) if b_roots else {}
-    grok_map = _get_grok_usage_map(g_root)
+    cached = _lru_get(_T3_FLOWS_CACHE, cache_key) if use_cache else _MISSING
+    if cached is not _MISSING:
+        c_fast_sig, c_meta_sig, c_watermark, c_tracked_roots, c_tr_sigs, c_grok_sigs, c_flows = cached
+        if (
+            c_fast_sig == fast_sig
+            and all(_stat_mtime_size(p) == s for p, s in c_tr_sigs)
+            and all(_stat_mtime_size(p) == s for p, s in c_grok_sigs)
+        ):
+            return _refresh_running_durations(c_flows, effective_now)
 
     try:
         conn = _open_ro(resolved_db)
@@ -742,85 +1006,87 @@ def discover_t3_flows(
         return []
 
     try:
-        # 1. Fetch slim subagent rows (NEVER pull full $.prompt or full $.result on list scan).
-        sub_rows = conn.execute(
-            """
-            SELECT
-                subagent_id,
-                thread_id,
-                run_id,
-                parent_node_id,
-                provider,
-                driver,
-                provider_instance_id,
-                provider_thread_id,
-                child_thread_id,
-                origin,
-                status,
-                started_at,
-                completed_at,
-                updated_at,
-                json_extract(payload_json, '$.title') AS title,
-                json_extract(payload_json, '$.role') AS role,
-                json_extract(payload_json, '$.model') AS model,
-                json_extract(payload_json, '$.modelSelection.model') AS ms_model,
-                substr(json_extract(payload_json, '$.result'), 1, 400) AS result_snippet,
-                substr(json_extract(payload_json, '$.prompt'), 1, 360) AS prompt_head
-            FROM orchestration_v2_projection_subagents
-            ORDER BY COALESCE(started_at, updated_at) ASC, subagent_id ASC
-            """
-        ).fetchall()
+        thread_cols = _table_columns(conn, "orchestration_v2_projection_threads")
+        run_cols = _table_columns(conn, "orchestration_v2_projection_runs")
+        sub_cols = _table_columns(conn, "orchestration_v2_projection_subagents")
+        pt_cols = _table_columns(conn, "orchestration_v2_projection_provider_threads")
+        proj_cols = _table_columns(conn, "projection_projects")
 
-        if not sub_rows:
+        live_runs_info, live_runs_sig = _fetch_live_runs(conn, run_cols)
+        sub_count, sub_max_upd = _query_subagent_watermark(conn, sub_cols)
+
+        # Tier-2 watermark check: skips full scan when WAL/DB moved due to unrelated writes.
+        if cached is not _MISSING:
+            _, c_meta_sig, c_watermark, c_tracked_roots, c_tr_sigs, c_grok_sigs, c_flows = cached
+            if c_meta_sig == meta_sig:
+                roots_wm = _query_roots_watermark(conn, thread_cols, c_tracked_roots)
+                watermark = (live_runs_sig, sub_count, sub_max_upd, roots_wm)
+                if (
+                    watermark == c_watermark
+                    and all(_stat_mtime_size(p) == s for p, s in c_tr_sigs)
+                    and all(_stat_mtime_size(p) == s for p, s in c_grok_sigs)
+                ):
+                    _lru_set(
+                        _T3_FLOWS_CACHE,
+                        cache_key,
+                        (fast_sig, meta_sig, watermark, c_tracked_roots, c_tr_sigs, c_grok_sigs, c_flows),
+                        _T3_FLOWS_CACHE_MAX,
+                    )
+                    return _refresh_running_durations(c_flows, effective_now)
+
+        # Phase 1: Lightweight subagent scan WITHOUT json_extract(payload_json, ...).
+        if sub_cols:
+            slim_sub_rows = conn.execute(
+                """
+                SELECT
+                    subagent_id,
+                    thread_id,
+                    child_thread_id,
+                    status,
+                    started_at,
+                    completed_at,
+                    updated_at
+                FROM orchestration_v2_projection_subagents
+                ORDER BY COALESCE(started_at, updated_at) ASC, subagent_id ASC
+                """
+            ).fetchall()
+        else:
+            slim_sub_rows = []
+
+        if not slim_sub_rows and not live_runs_info:
+            if use_cache:
+                watermark = (live_runs_sig, sub_count, sub_max_upd, (0, "", 0, 0))
+                _lru_set(
+                    _T3_FLOWS_CACHE,
+                    cache_key,
+                    (fast_sig, meta_sig, watermark, (), [], [], []),
+                    _T3_FLOWS_CACHE_MAX,
+                )
             return []
 
-        # 2. Fetch live runs via partial recovery_idx (< 0.3 ms).
-        live_runs: dict[str, str] = {}
-        for r in conn.execute(
-            """
-            SELECT thread_id, status
-            FROM orchestration_v2_projection_runs
-            WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
-            """
-        ):
-            tid = r["thread_id"]
-            st = r["status"]
-            # Prefer 'running' over 'queued'/'waiting' if multiple active runs exist.
-            if tid not in live_runs or st == "running":
-                live_runs[tid] = st
+        brain_map = _get_brain_transcript_map(b_roots) if b_roots else {}
+        grok_map = _get_grok_usage_map(g_root)
 
-        # 3. Load thread lineage + metadata for all referenced threads (and walk up ancestors).
-        referenced_tids: set[str] = set()
-        for s in sub_rows:
+        # 3. Load thread lineage + metadata for subagents AND live runs (and walk up ancestors).
+        referenced_tids: set[str] = set(live_runs_info.keys())
+        for s in slim_sub_rows:
             if s["thread_id"]:
                 referenced_tids.add(s["thread_id"])
             if s["child_thread_id"]:
                 referenced_tids.add(s["child_thread_id"])
 
         threads_by_id: dict[str, dict[str, Any]] = {}
+        thread_select = _thread_select_sql(thread_cols) if thread_cols else ""
 
         def _fetch_threads(tids: set[str]) -> None:
+            if not thread_select:
+                return
             missing = [t for t in tids if t and t not in threads_by_id]
             for i in range(0, len(missing), 400):
                 chunk = missing[i : i + 400]
                 ph = ",".join("?" * len(chunk))
                 q = f"""
-                    SELECT
-                        thread_id,
-                        project_id,
-                        title,
-                        default_provider,
-                        provider_instance_id,
-                        active_provider_thread_id,
-                        created_at,
-                        updated_at,
-                        archived_at,
-                        deleted_at,
-                        json_extract(payload_json, '$.lineage.rootThreadId') AS root_thread_id,
-                        json_extract(payload_json, '$.lineage.parentThreadId') AS parent_thread_id,
-                        json_extract(payload_json, '$.lineage.relationshipToParent') AS rel_to_parent,
-                        json_extract(payload_json, '$.modelSelection.model') AS model,
-                        json_extract(payload_json, '$.worktreePath') AS worktree_path
+                    SELECT {thread_select}
                     FROM orchestration_v2_projection_threads
                     WHERE thread_id IN ({ph})
                 """
@@ -828,7 +1094,6 @@ def discover_t3_flows(
                     threads_by_id[row["thread_id"]] = dict(row)
 
         _fetch_threads(referenced_tids)
-        # Fetch any ancestor rootThreadId / parentThreadId not yet in threads_by_id.
         for _ in range(4):
             ancestors: set[str] = set()
             for t in threads_by_id.values():
@@ -859,35 +1124,118 @@ def discover_t3_flows(
                 cur = str(parent)
             return cur or tid
 
-        # 4. Group subagents under their rootThreadId.
-        trees_subs: dict[str, list[sqlite3.Row]] = {}
-        for s in sub_rows:
-            root_tid = _resolve_root_thread_id(s["thread_id"])
-            trees_subs.setdefault(root_tid, []).append(s)
+        live_runs: dict[str, str] = {tid: info["status"] for tid, info in live_runs_info.items()}
 
-        # Compute latest activity per root tree and keep the most recent `limit_trees`.
-        tree_activity: list[tuple[str, str]] = []
-        for root_tid, subs in trees_subs.items():
+        # 4. Group slim subagents under rootThreadId; prioritize live/active trees before truncation.
+        slim_trees_subs: dict[str, list[sqlite3.Row]] = {}
+        for s in slim_sub_rows:
+            root_tid = _resolve_root_thread_id(s["thread_id"])
+            slim_trees_subs.setdefault(root_tid, []).append(s)
+
+        tree_activity: list[tuple[int, str, str]] = []
+        for root_tid, subs in slim_trees_subs.items():
             root_info = threads_by_id.get(root_tid)
-            # Skip deleted root threads if marked deleted.
             if root_info and root_info.get("deleted_at"):
                 continue
             latest = (root_info.get("updated_at") if root_info else "") or ""
+            is_live_tree = root_tid in live_runs
             for s in subs:
                 for ts_col in (s["updated_at"], s["completed_at"], s["started_at"]):
                     if ts_col and ts_col > latest:
                         latest = ts_col
-            tree_activity.append((latest, root_tid))
+                if not is_live_tree:
+                    if s["thread_id"] in live_runs or (s["child_thread_id"] and s["child_thread_id"] in live_runs):
+                        is_live_tree = True
+                    elif normalize_state(s["status"]) in ("running", "waiting", "queued"):
+                        is_live_tree = True
+            tree_activity.append((1 if is_live_tree else 0, latest, root_tid))
 
-        tree_activity.sort(key=lambda item: item[0], reverse=True)
-        selected_roots = [rtid for _, rtid in tree_activity[: max(1, int(limit_trees))]]
-        if not selected_roots:
+        tree_activity.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected_roots = [rtid for _, _, rtid in tree_activity[: max(1, int(limit_trees))]]
+        selected_roots_set = set(selected_roots)
+
+        # Standalone live threads whose root is not already covered by a selected delegation tree.
+        standalone_live_roots: list[str] = []
+        standalone_live_status: dict[str, str] = {}
+        standalone_live_requested_at: dict[str, str | None] = {}
+        for tid, run_info in live_runs_info.items():
+            tinfo = threads_by_id.get(tid)
+            if tinfo is None or tinfo.get("deleted_at") or tinfo.get("archived_at"):
+                continue
+            root_tid = _resolve_root_thread_id(tid)
+            if root_tid in selected_roots_set:
+                continue
+            rinfo = threads_by_id.get(root_tid)
+            if rinfo is None or rinfo.get("deleted_at") or rinfo.get("archived_at"):
+                continue
+            if root_tid not in standalone_live_status:
+                standalone_live_roots.append(root_tid)
+                standalone_live_status[root_tid] = run_info["status"]
+                standalone_live_requested_at[root_tid] = run_info.get("requested_at")
+            elif run_info["status"] == "running" or tid == root_tid:
+                standalone_live_status[root_tid] = run_info["status"]
+                if run_info.get("requested_at"):
+                    standalone_live_requested_at[root_tid] = run_info["requested_at"]
+
+        standalone_live_roots.sort(
+            key=lambda rtid: (threads_by_id.get(rtid) or {}).get("updated_at") or "",
+            reverse=True,
+        )
+
+        if not selected_roots and not standalone_live_roots:
+            if use_cache:
+                watermark = (live_runs_sig, sub_count, sub_max_upd, (0, "", 0, 0))
+                _lru_set(
+                    _T3_FLOWS_CACHE,
+                    cache_key,
+                    (fast_sig, meta_sig, watermark, (), [], [], []),
+                    _T3_FLOWS_CACHE_MAX,
+                )
             return []
 
-        # 5. Collect IDs for selected trees to fetch projects, provider_threads, and full results.
+        # Phase 2: Extract payload_json fields ONLY for subagents of selected_roots.
         selected_sub_ids: list[str] = []
+        for root_tid in selected_roots:
+            for s in slim_trees_subs[root_tid]:
+                selected_sub_ids.append(s["subagent_id"])
+
+        full_sub_by_id: dict[str, sqlite3.Row] = {}
+        for i in range(0, len(selected_sub_ids), 400):
+            chunk = selected_sub_ids[i : i + 400]
+            ph = ",".join("?" * len(chunk))
+            for row in conn.execute(
+                f"""
+                SELECT
+                    subagent_id,
+                    thread_id,
+                    run_id,
+                    parent_node_id,
+                    provider,
+                    driver,
+                    provider_instance_id,
+                    provider_thread_id,
+                    child_thread_id,
+                    origin,
+                    status,
+                    started_at,
+                    completed_at,
+                    updated_at,
+                    json_extract(payload_json, '$.title') AS title,
+                    json_extract(payload_json, '$.role') AS role,
+                    json_extract(payload_json, '$.model') AS model,
+                    json_extract(payload_json, '$.modelSelection.model') AS ms_model,
+                    substr(json_extract(payload_json, '$.result'), 1, 400) AS result_snippet,
+                    substr(json_extract(payload_json, '$.prompt'), 1, 360) AS prompt_head
+                FROM orchestration_v2_projection_subagents
+                WHERE subagent_id IN ({ph})
+                """,
+                chunk,
+            ):
+                full_sub_by_id[row["subagent_id"]] = row
+
+        trees_subs: dict[str, list[sqlite3.Row]] = {}
         sub_updated_by_id: dict[str, str] = {}
-        selected_thread_ids: set[str] = set(selected_roots)
+        selected_thread_ids: set[str] = set(selected_roots) | set(standalone_live_roots)
         selected_pt_ids: set[str] = set()
         selected_project_ids: set[str] = set()
 
@@ -898,9 +1246,13 @@ def discover_t3_flows(
                     selected_project_ids.add(rinfo["project_id"])
                 if rinfo.get("active_provider_thread_id"):
                     selected_pt_ids.add(rinfo["active_provider_thread_id"])
-            for s in trees_subs[root_tid]:
-                sid = s["subagent_id"]
-                selected_sub_ids.append(sid)
+            tree_full: list[sqlite3.Row] = []
+            for slim_s in slim_trees_subs[root_tid]:
+                sid = slim_s["subagent_id"]
+                s = full_sub_by_id.get(sid)
+                if s is None:
+                    continue
+                tree_full.append(s)
                 sub_updated_by_id[sid] = str(s["updated_at"] or "")
                 if s["thread_id"]:
                     selected_thread_ids.add(s["thread_id"])
@@ -916,10 +1268,19 @@ def discover_t3_flows(
                         selected_pt_ids.add(cinfo["active_provider_thread_id"])
                 if s["provider_thread_id"]:
                     selected_pt_ids.add(s["provider_thread_id"])
+            trees_subs[root_tid] = tree_full
+
+        for root_tid in standalone_live_roots:
+            rinfo = threads_by_id.get(root_tid)
+            if rinfo:
+                if rinfo.get("project_id"):
+                    selected_project_ids.add(rinfo["project_id"])
+                if rinfo.get("active_provider_thread_id"):
+                    selected_pt_ids.add(rinfo["active_provider_thread_id"])
 
         # Fetch projects.
         projects_by_id: dict[str, dict[str, Any]] = {}
-        if selected_project_ids:
+        if selected_project_ids and proj_cols:
             pids = list(selected_project_ids)
             for i in range(0, len(pids), 400):
                 chunk = pids[i : i + 400]
@@ -930,11 +1291,11 @@ def discover_t3_flows(
                 ):
                     projects_by_id[row["project_id"]] = dict(row)
 
-        # Fetch provider_threads nativeId mappings for selected trees.
+        # Fetch provider_threads nativeId mappings for selected trees and standalone live threads.
         pt_native_by_ptid: dict[str, tuple[str | None, str | None]] = {}
         pt_native_by_tid: dict[str, tuple[str | None, str | None]] = {}
 
-        if selected_pt_ids:
+        if selected_pt_ids and pt_cols:
             ptids = list(selected_pt_ids)
             for i in range(0, len(ptids), 400):
                 chunk = ptids[i : i + 400]
@@ -958,7 +1319,7 @@ def discover_t3_flows(
                         if row["thread_id"] and row["thread_id"] not in pt_native_by_tid:
                             pt_native_by_tid[row["thread_id"]] = (nid, drv)
 
-        if selected_thread_ids:
+        if selected_thread_ids and pt_cols:
             tids = list(selected_thread_ids)
             for i in range(0, len(tids), 400):
                 chunk = tids[i : i + 400]
@@ -984,31 +1345,25 @@ def discover_t3_flows(
                         if row["provider_thread_id"] and row["provider_thread_id"] not in pt_native_by_ptid:
                             pt_native_by_ptid[row["provider_thread_id"]] = (nid, drv)
 
-        # Fetch full $.result ONLY for uncached selected trees' subagents (still NEVER pulling $.prompt).
-        try:
-            db_ino = resolved_db.stat().st_ino
-        except OSError:
-            db_ino = 0
+        # Fetch full $.result ONLY for uncached selected trees' subagents (bounded LRU <=128 entries / 2 MB).
+        db_ino = db_sig[0] if db_sig else 0
         db_key = str(resolved_db)
-
-        if len(_SUBAGENT_RESULT_CACHE) > 4096:
-            _SUBAGENT_RESULT_CACHE.clear()
 
         full_results: dict[str, str] = {}
         uncached_sub_ids: list[str] = []
         for sid in selected_sub_ids:
             ckey = (db_key, db_ino, sid, sub_updated_by_id.get(sid, ""))
-            if ckey in _SUBAGENT_RESULT_CACHE:
-                cached_res = _SUBAGENT_RESULT_CACHE[ckey]
+            cached_res = _subagent_result_cache_get(ckey)
+            if cached_res is not _MISSING:
                 if isinstance(cached_res, str) and cached_res.strip():
                     full_results[sid] = cached_res
             else:
                 uncached_sub_ids.append(sid)
 
-        fetched_map: dict[str, str] = {}
-        for i in range(0, len(uncached_sub_ids), 400):
-            chunk = uncached_sub_ids[i : i + 400]
+        for i in range(0, len(uncached_sub_ids), 32):
+            chunk = uncached_sub_ids[i : i + 32]
             ph = ",".join("?" * len(chunk))
+            seen_in_chunk: set[str] = set()
             for row in conn.execute(
                 f"""
                 SELECT subagent_id, json_extract(payload_json, '$.result') AS full_result
@@ -1018,15 +1373,15 @@ def discover_t3_flows(
                 """,
                 chunk,
             ):
-                if isinstance(row["full_result"], str) and row["full_result"].strip():
-                    fetched_map[row["subagent_id"]] = row["full_result"]
-
-        for sid in uncached_sub_ids:
-            val = fetched_map.get(sid)
-            ckey = (db_key, db_ino, sid, sub_updated_by_id.get(sid, ""))
-            _SUBAGENT_RESULT_CACHE[ckey] = val
-            if val is not None:
-                full_results[sid] = val
+                sid = row["subagent_id"]
+                val = row["full_result"]
+                if isinstance(val, str) and val.strip():
+                    seen_in_chunk.add(sid)
+                    full_results[sid] = val
+                    _subagent_result_cache_set((db_key, db_ino, sid, sub_updated_by_id.get(sid, "")), val)
+            for sid in chunk:
+                if sid not in seen_in_chunk:
+                    _subagent_result_cache_set((db_key, db_ino, sid, sub_updated_by_id.get(sid, "")), None)
 
         # Fetch tool call counts per thread via covering index (type, status) without reading payload_json.
         turn_item_trace_by_tid: dict[str, list[list[Any]]] = {}
@@ -1061,10 +1416,10 @@ def discover_t3_flows(
     finally:
         conn.close()
 
-    # 6. Assemble normalized Flow objects for each selected root tree.
+    # 6. Assemble normalized Flow objects for each selected delegation tree.
     flows: list[dict[str, Any]] = []
     for root_tid in selected_roots:
-        subs = trees_subs[root_tid]
+        subs = trees_subs.get(root_tid, [])
         root_info = threads_by_id.get(root_tid) or {}
         project_id = root_info.get("project_id")
         if not project_id:
@@ -1208,7 +1563,7 @@ def discover_t3_flows(
                 state=istate,
                 started_at=istart,
                 ended_at=iend,
-                dur_s=compute_dur_s(istart, iend, is_running=(istate == "running"), now_ts=now_ts),
+                dur_s=compute_dur_s(istart, iend, is_running=(istate == "running"), now_ts=effective_now),
                 tokens=itok,
                 cost_usd=icost,
                 trace=itrace,
@@ -1263,7 +1618,7 @@ def discover_t3_flows(
 
             started_at = s["started_at"] or (cinfo.get("created_at") if cinfo else None)
             ended_at = None if norm_state == "running" else (s["completed_at"] or s["updated_at"])
-            dur_s = compute_dur_s(started_at, ended_at, is_running=(norm_state == "running"), now_ts=now_ts)
+            dur_s = compute_dur_s(started_at, ended_at, is_running=(norm_state == "running"), now_ts=effective_now)
 
             # Resolve native session ID via provider_thread_id or child_thread_id.
             native_id: str | None = None
@@ -1335,6 +1690,8 @@ def discover_t3_flows(
             snippet = _clip_snippet(s["result_snippet"] or full_res)
             if full_res:
                 res_out_id = f"res-{agent_id}"
+                res_bytes = len(full_res.encode("utf-8"))
+                res_body = full_res if res_bytes <= _MAX_INLINE_RESULT_BYTES else None
                 outputs.append(
                     make_output(
                         res_out_id,
@@ -1342,8 +1699,8 @@ def discover_t3_flows(
                         f"{name} result",
                         by=agent_id,
                         at=ended_at or s["updated_at"],
-                        body=full_res,
-                        size=len(full_res.encode("utf-8")),
+                        body=res_body,
+                        size=res_bytes,
                         meta={"subagentId": s["subagent_id"]},
                     )
                 )
@@ -1404,7 +1761,6 @@ def discover_t3_flows(
             sub_agents.append(sub_agent)
 
         # Assemble root Agent.
-
         non_root_agents = intermediate_agents + sub_agents
         root_state = _derive_root_state(root_tid, live_runs, [a["state"] for a in non_root_agents])
 
@@ -1419,7 +1775,7 @@ def discover_t3_flows(
                 if ts_val and ts_val > latest_updated:
                     latest_updated = ts_val
         root_ended = None if root_state == "running" else (latest_updated or None)
-        root_dur = compute_dur_s(root_started, root_ended, is_running=(root_state == "running"), now_ts=now_ts)
+        root_dur = compute_dur_s(root_started, root_ended, is_running=(root_state == "running"), now_ts=effective_now)
 
         root_lab = normalize_lab(root_res_model, root_drv or root_provider)
         if root_lab == "other" and not root_res_model and not root_provider:
@@ -1509,29 +1865,597 @@ def discover_t3_flows(
             )
         )
 
-    if use_cache:
-        tr_sigs = [
-            (str(tr_path), _stat_mtime_size(str(tr_path)))
-            for f in flows
-            for o in f.get("outputs") or ()
-            if o.get("kind") == "transcript" and isinstance(o.get("path"), str)
-            for tr_path in (o["path"],)
+    # 7. Assemble normalized Flow objects for standalone live T3 threads.
+    for root_tid in standalone_live_roots:
+        root_info = threads_by_id.get(root_tid) or {}
+        project_id = root_info.get("project_id")
+        proj_info = projects_by_id.get(project_id) if project_id else None
+        project_root = proj_info.get("workspace_root") if proj_info else None
+        project_title = (proj_info.get("title") if proj_info else None) or ""
+
+        root_title = root_info.get("title") or root_tid
+        root_model = root_info.get("model")
+        root_provider = root_info.get("default_provider") or root_info.get("provider_instance_id")
+        root_nid, root_drv = pt_native_by_tid.get(root_tid, (None, None))
+        if not root_nid and root_info.get("active_provider_thread_id"):
+            root_nid, root_drv = pt_native_by_ptid.get(root_info["active_provider_thread_id"], (None, None))
+
+        root_tokens, root_cost, root_trace, root_last, root_res_model, root_tr_path, root_cost_est, root_cache_read = _resolve_telemetry(
+            provider=root_drv or root_provider,
+            model=root_model,
+            native_id=root_nid,
+            rate_table=rt,
+            usage_index=ui,
+            brain_map=brain_map,
+            grok_map=grok_map,
+        )
+        if not root_trace:
+            root_trace = turn_item_trace_by_tid.get(root_tid, [])
+
+        root_state = normalize_state(standalone_live_status[root_tid])
+        root_started = root_info.get("created_at") or standalone_live_requested_at.get(root_tid)
+        latest_updated = root_info.get("updated_at") or root_started
+        root_ended = None if root_state == "running" else latest_updated
+        root_dur = compute_dur_s(root_started, root_ended, is_running=(root_state == "running"), now_ts=effective_now)
+
+        root_lab = normalize_lab(root_res_model, root_drv or root_provider)
+        if root_lab == "other" and not root_res_model and not root_provider:
+            root_lab = "t3"
+
+        root_links = []
+        rt_link = _t3_thread_link(resolved_env_id, root_tid)
+        if rt_link:
+            root_links.append(rt_link)
+        rs_link = make_session_link(root_drv or root_provider, root_nid)
+        if rs_link:
+            root_links.append(rs_link)
+
+        root_tr_id = f"tr-{root_tid}"
+        outputs = [
+            make_output(
+                root_tr_id,
+                "transcript",
+                f"{root_title} transcript",
+                path=str(root_tr_path) if root_tr_path else None,
+                by=root_tid,
+                at=root_ended or root_started,
+                meta={"threadId": root_tid, "nativeId": root_nid},
+            )
         ]
-        grok_sigs: list[tuple[str, tuple[int, int] | None]] = []
-        seen_grok: set[str] = set()
-        for f in flows:
-            for o in f.get("outputs") or ():
-                nid = (o.get("meta") or {}).get("nativeId") if isinstance(o, dict) else None
-                if isinstance(nid, str) and nid in grok_map:
-                    gp = str(grok_map[nid])
-                    if gp not in seen_grok:
-                        seen_grok.add(gp)
-                        grok_sigs.append((gp, _stat_mtime_size(gp)))
-        if len(_T3_FLOWS_CACHE) > 32:
-            _T3_FLOWS_CACHE.clear()
-        _T3_FLOWS_CACHE[cache_key] = (sig, tr_sigs, grok_sigs, flows)
+
+        root_agent = make_agent(
+            root_tid,
+            root_title,
+            parent=None,
+            role="root",
+            lab=root_lab,
+            model=root_res_model,
+            provider=root_drv or root_provider,
+            state=root_state,
+            started_at=root_started,
+            ended_at=root_ended,
+            dur_s=root_dur,
+            tokens=root_tokens,
+            cost_usd=root_cost,
+            trace=root_trace,
+            last=root_last,
+            links=root_links,
+            output_ids=[root_tr_id],
+        )
+        root_agent["costEstimated"] = root_cost_est
+        if root_tokens is not None and root_cache_read is not None:
+            root_agent["cacheRead"] = root_cache_read
+        root_raw_title = root_info.get("title") or (
+            root_title if not _PURE_UUID_RE.match(str(root_title)) else None
+        )
+        root_agent["_labelHint"] = {
+            "prompt": None,
+            "slug": None,
+            "planTask": None,
+            "rawTitle": _bound_hint(root_raw_title, _LABEL_HINT_MAX_CHARS),
+        }
+
+        flow_links = [rt_link] if rt_link else []
+        flows.append(
+            make_flow(
+                f"t3:{root_tid}",
+                root_title,
+                project=project_title,
+                project_root=project_root,
+                harness="t3",
+                kind="thread",
+                started_at=root_started,
+                updated_at=latest_updated or root_started,
+                agents=[root_agent],
+                outputs=outputs,
+                links=flow_links,
+            )
+        )
+
+    if use_cache:
+        tr_sigs, grok_sigs = _collect_t3_cache_sigs(flows, grok_map)
+        tracked_roots = tuple(dict.fromkeys(list(selected_roots) + list(standalone_live_roots)))
+        roots_wm = _compute_roots_watermark_from_map(threads_by_id, thread_cols, tracked_roots)
+        watermark = (live_runs_sig, sub_count, sub_max_upd, roots_wm)
+        _lru_set(
+            _T3_FLOWS_CACHE,
+            cache_key,
+            (fast_sig, meta_sig, watermark, tracked_roots, tr_sigs, grok_sigs, flows),
+            _T3_FLOWS_CACHE_MAX,
+        )
 
     return flows
+
+
+def discover_active_threads(
+    db_path: Path | None = None,
+    *,
+    env_id: str | None = None,
+    limit_recent: int = 20,
+    rate_table: RateTable | None = None,
+    usage_index: UsageIndex | None = None,
+    brain_roots: list[Path] | None = None,
+    grok_sessions_root: Path | None = None,
+    now_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    """Discover live T3 threads and recent unsettled top-level threads (last 48h)."""
+    resolved_db = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    if not resolved_db.is_file():
+        return []
+
+    resolved_env_id = _read_env_id(env_id)
+    rt = rate_table if rate_table is not None else _DEFAULT_RATE_TABLE
+    ui = usage_index if usage_index is not None else _DEFAULT_USAGE_INDEX
+    b_roots = _discover_brain_roots(brain_roots)
+    g_root = grok_sessions_root if grok_sessions_root is not None else DEFAULT_GROK_SESSIONS_ROOT
+
+    use_cache = now_ts is None
+    effective_now = float(now_ts) if now_ts is not None else time.time()
+    lim_recent = max(0, int(limit_recent))
+    cache_key = (
+        str(resolved_db),
+        resolved_env_id,
+        lim_recent,
+        str(rt.path),
+        str(ui.path),
+        str(g_root),
+        tuple(str(p) for p in b_roots),
+    )
+    wal_path = f"{resolved_db}-wal"
+    db_sig = _stat_ino_sig(resolved_db)
+    wal_sig = _stat_ino_sig(wal_path)
+    rt_sig = rt.cache_signature()
+    ui_sig = _stat_ino_sig(ui.path)
+    fast_sig = (db_sig, wal_sig, rt_sig, ui_sig)
+    meta_sig = (db_sig[0] if db_sig else None, rt_sig, ui_sig)
+
+    cached = _lru_get(_ACTIVE_THREADS_CACHE, cache_key) if use_cache else _MISSING
+    if cached is not _MISSING:
+        c_fast_sig, c_meta_sig, c_watermark, c_tr_sigs, c_oldest_recent_ts, c_items = cached
+        window_ok = c_oldest_recent_ts is None or (effective_now - c_oldest_recent_ts) <= _ACTIVE_RECENT_WINDOW_S
+        if (
+            c_fast_sig == fast_sig
+            and window_ok
+            and all(_stat_mtime_size(p) == s for p, s in c_tr_sigs)
+        ):
+            return _refresh_active_thread_durations(c_items, effective_now)
+
+    try:
+        conn = _open_ro(resolved_db)
+    except sqlite3.Error:
+        return []
+
+    try:
+        thread_cols = _table_columns(conn, "orchestration_v2_projection_threads")
+        if not thread_cols:
+            return []
+        run_cols = _table_columns(conn, "orchestration_v2_projection_runs")
+        sub_cols = _table_columns(conn, "orchestration_v2_projection_subagents")
+        pt_cols = _table_columns(conn, "orchestration_v2_projection_provider_threads")
+        proj_cols = _table_columns(conn, "projection_projects")
+
+        live_runs_info, live_runs_sig = _fetch_live_runs(conn, run_cols)
+        sub_count, sub_max_upd = _query_subagent_watermark(conn, sub_cols)
+        threads_wm = _query_active_threads_watermark(conn, thread_cols)
+        watermark = (live_runs_sig, sub_count, sub_max_upd, threads_wm)
+
+        if cached is not _MISSING:
+            _, c_meta_sig, c_watermark, c_tr_sigs, c_oldest_recent_ts, c_items = cached
+            window_ok = c_oldest_recent_ts is None or (effective_now - c_oldest_recent_ts) <= _ACTIVE_RECENT_WINDOW_S
+            if (
+                c_meta_sig == meta_sig
+                and c_watermark == watermark
+                and window_ok
+                and all(_stat_mtime_size(p) == s for p, s in c_tr_sigs)
+            ):
+                _lru_set(
+                    _ACTIVE_THREADS_CACHE,
+                    cache_key,
+                    (fast_sig, meta_sig, watermark, c_tr_sigs, c_oldest_recent_ts, c_items),
+                    _ACTIVE_THREADS_CACHE_MAX,
+                )
+                return _refresh_active_thread_durations(c_items, effective_now)
+
+        brain_map = _get_brain_transcript_map(b_roots) if b_roots else {}
+        grok_map = _get_grok_usage_map(g_root)
+
+        thread_select = _thread_select_sql(thread_cols)
+        threads_by_id: dict[str, dict[str, Any]] = {}
+
+        def _fetch_threads(tids: set[str]) -> None:
+            missing = [t for t in tids if t and t not in threads_by_id]
+            for i in range(0, len(missing), 400):
+                chunk = missing[i : i + 400]
+                ph = ",".join("?" * len(chunk))
+                for row in conn.execute(
+                    f"SELECT {thread_select} FROM orchestration_v2_projection_threads WHERE thread_id IN ({ph})",
+                    chunk,
+                ):
+                    threads_by_id[row["thread_id"]] = dict(row)
+
+        # 1. Fetch all threads referenced by live runs.
+        if live_runs_info:
+            _fetch_threads(set(live_runs_info.keys()))
+
+        # 2. Fetch up to `limit_recent` recent unsettled top-level threads updated within 48h.
+        cutoff_ts = effective_now - _ACTIVE_RECENT_WINDOW_S
+        recent_top_ids: list[str] = []
+        oldest_recent_ts: float | None = None
+        if lim_recent > 0:
+            where_parts: list[str] = []
+            params: list[Any] = []
+            if "deleted_at" in thread_cols:
+                where_parts.append("deleted_at IS NULL")
+            if "archived_at" in thread_cols:
+                where_parts.append("archived_at IS NULL")
+            if "updated_at" in thread_cols:
+                probe_iso = to_iso_utc(cutoff_ts - 86_400.0)
+                if probe_iso:
+                    where_parts.append("updated_at >= ?")
+                    params.append(probe_iso)
+            if "payload_json" in thread_cols:
+                where_parts.append("json_extract(payload_json, '$.settledAt') IS NULL")
+                where_parts.append("json_extract(payload_json, '$.lineage.parentThreadId') IS NULL")
+            where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            order_sql = "ORDER BY updated_at DESC" if "updated_at" in thread_cols else ""
+            fetch_lim = lim_recent * 3 + 20
+            q_recent = f"SELECT {thread_select} FROM orchestration_v2_projection_threads {where_sql} {order_sql} LIMIT ?"
+            params.append(fetch_lim)
+            recent_rows: list[tuple[float, dict[str, Any]]] = []
+            for row in conn.execute(q_recent, params):
+                d = dict(row)
+                if d.get("deleted_at") or d.get("archived_at") or d.get("settled_at"):
+                    continue
+                if d.get("parent_thread_id"):
+                    continue
+                upd_ts = parse_iso_ts(d.get("updated_at") or d.get("created_at"))
+                if upd_ts is None or upd_ts < cutoff_ts:
+                    continue
+                threads_by_id[d["thread_id"]] = d
+                recent_rows.append((upd_ts, d))
+            recent_rows.sort(key=lambda pair: pair[0], reverse=True)
+            for upd_ts, d in recent_rows[:lim_recent]:
+                recent_top_ids.append(d["thread_id"])
+                if oldest_recent_ts is None or upd_ts < oldest_recent_ts:
+                    oldest_recent_ts = upd_ts
+
+        # Collect included thread IDs (all non-deleted/non-archived live threads + recent top-level threads).
+        included_ids: list[str] = []
+        included_set: set[str] = set()
+        for tid in live_runs_info:
+            tinfo = threads_by_id.get(tid)
+            if tinfo is None or tinfo.get("deleted_at") or tinfo.get("archived_at"):
+                continue
+            if tid not in included_set:
+                included_set.add(tid)
+                included_ids.append(tid)
+        for tid in recent_top_ids:
+            if tid not in included_set:
+                included_set.add(tid)
+                included_ids.append(tid)
+
+        if not included_ids:
+            if use_cache:
+                _lru_set(
+                    _ACTIVE_THREADS_CACHE,
+                    cache_key,
+                    (fast_sig, meta_sig, watermark, [], None, []),
+                    _ACTIVE_THREADS_CACHE_MAX,
+                )
+            return []
+
+        # 3. Fetch lightweight subagent rows to map delegation roots & child counts.
+        slim_sub_rows: list[sqlite3.Row] = []
+        if sub_cols:
+            slim_sub_rows = conn.execute(
+                "SELECT subagent_id, thread_id, child_thread_id, status FROM orchestration_v2_projection_subagents"
+            ).fetchall()
+            sub_tids = {str(s["thread_id"]) for s in slim_sub_rows if s["thread_id"]}
+            if sub_tids:
+                _fetch_threads(sub_tids)
+
+        # Resolve ancestors for all loaded threads (up to 4 hops).
+        for _ in range(4):
+            ancestors: set[str] = set()
+            for t in threads_by_id.values():
+                if t.get("root_thread_id") and t["root_thread_id"] not in threads_by_id:
+                    ancestors.add(t["root_thread_id"])
+                if t.get("parent_thread_id") and t["parent_thread_id"] not in threads_by_id:
+                    ancestors.add(t["parent_thread_id"])
+            if not ancestors:
+                break
+            _fetch_threads(ancestors)
+
+        def _resolve_root_thread_id(tid: str) -> str:
+            t = threads_by_id.get(tid)
+            if t and t.get("root_thread_id"):
+                return str(t["root_thread_id"])
+            cur = tid
+            visited: set[str] = set()
+            while cur and cur not in visited:
+                visited.add(cur)
+                info = threads_by_id.get(cur)
+                if not info:
+                    break
+                if info.get("root_thread_id"):
+                    return str(info["root_thread_id"])
+                parent = info.get("parent_thread_id")
+                if not parent:
+                    break
+                cur = str(parent)
+            return cur or tid
+
+        # Track delegation roots, live roots, and deduplicated active/total child counts.
+        delegation_roots: set[str] = set()
+        direct_children_state: dict[str, dict[str, bool]] = {}
+        tree_children_state: dict[str, dict[str, bool]] = {}
+        for s in slim_sub_rows:
+            ptid = s["thread_id"]
+            if not ptid:
+                continue
+            rtid = _resolve_root_thread_id(ptid)
+            rinfo = threads_by_id.get(rtid)
+            if not (rinfo and rinfo.get("deleted_at")):
+                delegation_roots.add(rtid)
+            ctid = s["child_thread_id"]
+            child_key = str(ctid or s["subagent_id"])
+            st_norm = normalize_state(s["status"])
+            is_child_active = bool(
+                (ctid and ctid in live_runs_info)
+                or (st_norm in ("running", "waiting", "queued"))
+            )
+            dc_map = direct_children_state.setdefault(str(ptid), {})
+            dc_map[child_key] = dc_map.get(child_key, False) or is_child_active
+            tc_map = tree_children_state.setdefault(rtid, {})
+            tc_map[child_key] = tc_map.get(child_key, False) or is_child_active
+
+        live_roots: set[str] = set()
+        for tid in live_runs_info:
+            tinfo = threads_by_id.get(tid)
+            if tinfo is None or tinfo.get("deleted_at") or tinfo.get("archived_at"):
+                continue
+            rtid = _resolve_root_thread_id(tid)
+            rinfo = threads_by_id.get(rtid)
+            if not (rinfo and (rinfo.get("deleted_at") or rinfo.get("archived_at"))):
+                live_roots.add(rtid)
+
+        # 4. Fetch latest run status for non-live included threads.
+        non_live_ids = [tid for tid in included_ids if tid not in live_runs_info]
+        latest_run_by_tid: dict[str, dict[str, Any]] = {}
+        if non_live_ids and "thread_id" in run_cols and "status" in run_cols:
+            order_col = "ordinal DESC" if "ordinal" in run_cols else "rowid DESC"
+            req_col = "requested_at" if "requested_at" in run_cols else "NULL AS requested_at"
+            for i in range(0, len(non_live_ids), 400):
+                chunk = non_live_ids[i : i + 400]
+                ph = ",".join("?" * len(chunk))
+                for row in conn.execute(
+                    f"""
+                    SELECT thread_id, status, {req_col}
+                    FROM orchestration_v2_projection_runs
+                    WHERE thread_id IN ({ph})
+                    ORDER BY thread_id ASC, {order_col}
+                    """,
+                    chunk,
+                ):
+                    tid = row["thread_id"]
+                    if tid not in latest_run_by_tid:
+                        latest_run_by_tid[tid] = dict(row)
+
+        # 5. Fetch projects & provider_threads mappings for included threads.
+        project_ids: set[str] = set()
+        pt_ids: set[str] = set()
+        for tid in included_ids:
+            tinfo = threads_by_id.get(tid)
+            if tinfo:
+                if tinfo.get("project_id"):
+                    project_ids.add(tinfo["project_id"])
+                if tinfo.get("active_provider_thread_id"):
+                    pt_ids.add(tinfo["active_provider_thread_id"])
+
+        projects_by_id: dict[str, dict[str, Any]] = {}
+        if project_ids and proj_cols:
+            pids = list(project_ids)
+            for i in range(0, len(pids), 400):
+                chunk = pids[i : i + 400]
+                ph = ",".join("?" * len(chunk))
+                for row in conn.execute(
+                    f"SELECT project_id, title, workspace_root FROM projection_projects WHERE project_id IN ({ph})",
+                    chunk,
+                ):
+                    projects_by_id[row["project_id"]] = dict(row)
+
+        pt_native_by_ptid: dict[str, tuple[str | None, str | None]] = {}
+        pt_native_by_tid: dict[str, tuple[str | None, str | None]] = {}
+        if pt_ids and pt_cols:
+            pids = list(pt_ids)
+            for i in range(0, len(pids), 400):
+                chunk = pids[i : i + 400]
+                ph = ",".join("?" * len(chunk))
+                for row in conn.execute(
+                    f"""
+                    SELECT
+                        provider_thread_id,
+                        thread_id,
+                        COALESCE(driver, provider) AS drv,
+                        json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
+                    FROM orchestration_v2_projection_provider_threads
+                    WHERE provider_thread_id IN ({ph})
+                    """,
+                    chunk,
+                ):
+                    nid = row["native_id"]
+                    drv = row["drv"]
+                    if nid:
+                        pt_native_by_ptid[row["provider_thread_id"]] = (nid, drv)
+                        if row["thread_id"] and row["thread_id"] not in pt_native_by_tid:
+                            pt_native_by_tid[row["thread_id"]] = (nid, drv)
+
+        if included_ids and pt_cols:
+            for i in range(0, len(included_ids), 400):
+                chunk = included_ids[i : i + 400]
+                ph = ",".join("?" * len(chunk))
+                for row in conn.execute(
+                    f"""
+                    SELECT
+                        provider_thread_id,
+                        thread_id,
+                        COALESCE(driver, provider) AS drv,
+                        json_extract(payload_json, '$.nativeThreadRef.nativeId') AS native_id
+                    FROM orchestration_v2_projection_provider_threads
+                    WHERE thread_id IN ({ph})
+                    ORDER BY updated_at DESC
+                    """,
+                    chunk,
+                ):
+                    nid = row["native_id"]
+                    drv = row["drv"]
+                    if nid:
+                        if row["thread_id"] and row["thread_id"] not in pt_native_by_tid:
+                            pt_native_by_tid[row["thread_id"]] = (nid, drv)
+                        if row["provider_thread_id"] and row["provider_thread_id"] not in pt_native_by_ptid:
+                            pt_native_by_ptid[row["provider_thread_id"]] = (nid, drv)
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+    items: list[dict[str, Any]] = []
+    tr_sigs: list[tuple[str, tuple[int, int] | None]] = []
+    seen_tr: set[str] = set()
+
+    for tid in included_ids:
+        tinfo = threads_by_id.get(tid) or {}
+        root_tid = _resolve_root_thread_id(tid)
+        parent_tid = tinfo.get("parent_thread_id") or None
+        proj_info = projects_by_id.get(tinfo.get("project_id")) if tinfo.get("project_id") else None
+        project_root = proj_info.get("workspace_root") if proj_info else None
+        project_title = (
+            (proj_info.get("title") if proj_info else None)
+            or (Path(project_root).name if project_root else "")
+        )
+
+        raw_model = tinfo.get("model")
+        prov = tinfo.get("default_provider") or tinfo.get("provider_instance_id")
+        nid, drv = pt_native_by_tid.get(tid, (None, None))
+        if not nid and tinfo.get("active_provider_thread_id"):
+            nid, drv = pt_native_by_ptid.get(tinfo["active_provider_thread_id"], (None, None))
+
+        _, _, _, last_act, resolved_model, tr_path, _, _ = _resolve_telemetry(
+            provider=drv or prov,
+            model=raw_model,
+            native_id=nid,
+            rate_table=rt,
+            usage_index=ui,
+            brain_map=brain_map,
+            grok_map=grok_map,
+        )
+        if tr_path is not None:
+            trp_str = str(tr_path)
+            if trp_str not in seen_tr:
+                seen_tr.add(trp_str)
+                tr_sigs.append((trp_str, _stat_mtime_size(trp_str)))
+
+        if tid in live_runs_info:
+            run_info = live_runs_info[tid]
+            state = normalize_state(run_info["status"])
+            started_at = run_info.get("requested_at") or tinfo.get("created_at")
+        else:
+            latest_run = latest_run_by_tid.get(tid)
+            state = normalize_state(latest_run["status"]) if latest_run else "done"
+            started_at = tinfo.get("created_at") or (latest_run.get("requested_at") if latest_run else None)
+
+        is_live = state in ("running", "waiting", "queued")
+        updated_at = tinfo.get("updated_at") or started_at
+        dur_s = compute_dur_s(
+            started_at,
+            None if is_live else updated_at,
+            is_running=is_live,
+            now_ts=effective_now,
+        )
+
+        lab = normalize_lab(resolved_model, drv or prov)
+        if lab == "other" and not resolved_model and not prov:
+            lab = "t3"
+
+        child_map = tree_children_state.get(tid, {}) if parent_tid is None else direct_children_state.get(tid, {})
+        total_children = len(child_map)
+        active_children = sum(1 for act in child_map.values() if act)
+
+        has_flow = (root_tid in delegation_roots) or (root_tid in live_roots)
+        flow_id = f"t3:{root_tid}" if has_flow else None
+        href = f"t3-thread://v2/{resolved_env_id}/{tid}" if resolved_env_id else None
+
+        links: list[dict[str, Any]] = []
+        tlink = _t3_thread_link(resolved_env_id, tid)
+        if tlink:
+            links.append(tlink)
+        slink = make_session_link(drv or prov, nid)
+        if slink:
+            links.append(slink)
+
+        items.append(
+            {
+                "id": tid,
+                "flowId": flow_id,
+                "rootThreadId": root_tid,
+                "parentThreadId": parent_tid,
+                "title": tinfo.get("title") or tid,
+                "project": project_title,
+                "projectRoot": project_root,
+                "harness": "t3",
+                "state": state,
+                "isLive": is_live,
+                "settled": bool(tinfo.get("settled_at")),
+                "model": resolved_model,
+                "lab": lab,
+                "startedAt": started_at,
+                "updatedAt": updated_at,
+                "durS": dur_s,
+                "activeChildren": active_children,
+                "totalChildren": total_children,
+                "last": last_act,
+                "href": href,
+                "links": links,
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            0 if item["isLive"] else 1,
+            0 if item["state"] == "running" else 1,
+            -(parse_iso_ts(item.get("updatedAt")) or 0.0),
+        )
+    )
+
+    if use_cache:
+        _lru_set(
+            _ACTIVE_THREADS_CACHE,
+            cache_key,
+            (fast_sig, meta_sig, watermark, tr_sigs, oldest_recent_ts, items),
+            _ACTIVE_THREADS_CACHE_MAX,
+        )
+
+    return items
 
 
 def load_subagent_detail(db_path: Path, subagent_id: str) -> dict[str, Any]:

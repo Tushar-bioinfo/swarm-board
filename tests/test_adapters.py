@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -12,16 +13,22 @@ from unittest.mock import patch
 
 from swarm_board.adapters import BoardRegistry
 from swarm_board.adapters.agy_swarms import (
+    STALE_THRESHOLD_S,
     discover_swarms,
     load_swarm_output,
     load_transcript_messages,
 )
 from swarm_board.adapters.cli_subagents import (
+    CLAUDE_STALE_THRESHOLD_S,
     discover_cli_flows,
     load_grok_chat_history,
 )
-from swarm_board.adapters.harness_runs import discover_harness_runs
+from swarm_board.adapters.harness_runs import (
+    HARNESS_STALE_THRESHOLD_S,
+    discover_harness_runs,
+)
 from swarm_board.adapters.t3_delegations import (
+    discover_active_threads,
     discover_t3_flows,
     load_subagent_detail,
     load_thread_messages,
@@ -34,6 +41,32 @@ from swarm_board.schema import (
     make_session_link,
     normalize_lab,
     normalize_state,
+)
+
+EXPECTED_ACTIVE_THREAD_KEYS = frozenset(
+    {
+        "id",
+        "flowId",
+        "rootThreadId",
+        "parentThreadId",
+        "title",
+        "project",
+        "projectRoot",
+        "harness",
+        "state",
+        "isLive",
+        "settled",
+        "model",
+        "lab",
+        "startedAt",
+        "updatedAt",
+        "durS",
+        "activeChildren",
+        "totalChildren",
+        "last",
+        "href",
+        "links",
+    }
 )
 
 
@@ -492,6 +525,132 @@ class AgySwarmsAdapterTests(unittest.TestCase):
             tr_msgs = load_transcript_messages(brain, worker_id, limit=10)
             self.assertEqual(len(tr_msgs), 4)
 
+    def test_agy_coordinator_waiting_transitions_to_done_only_when_workers_terminal_and_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            brain = root / "brain"
+            now_ts = 1795610000.0
+            stale_ts = now_ts - STALE_THRESHOLD_S - 120.0
+            fresh_ts = now_ts - 60.0
+
+            def _make_swarm(
+                swarm_uuid: str,
+                worker_state: str,
+                coord_mtime: float,
+                worker_mtime: float,
+            ) -> None:
+                c_cid = f"{swarm_uuid}-coord"
+                w_cid = f"{swarm_uuid}-worker"
+                h_cid = f"{swarm_uuid}-monitor"
+                sdir = brain / c_cid / ".system_generated" / "swarm"
+                sdir.mkdir(parents=True)
+                (sdir / "swarm.json").write_text(
+                    json.dumps({"swarm_id": swarm_uuid, "backend": "local", "created_at": "2026-11-25T08:00:00Z"}),
+                    encoding="utf-8",
+                )
+                (sdir / "members.json").write_text(
+                    json.dumps(
+                        {
+                            "title": f"Swarm {swarm_uuid}",
+                            "members": {
+                                "coordinator": {
+                                    "conversation_id": c_cid,
+                                    "role": "coordinator",
+                                    "wake_mode": "mentions",
+                                    "applied_model": "gemini-4-neon",
+                                },
+                                "worker-a": {
+                                    "conversation_id": w_cid,
+                                    "role": "worker",
+                                    "wake_mode": "working",
+                                    "applied_model": "gemini-4-neon",
+                                },
+                                "monitor": {
+                                    "conversation_id": h_cid,
+                                    "role": "monitor",
+                                    "wake_mode": "mentions",
+                                    "killed": True,
+                                },
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (sdir / "board.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "seq": 1,
+                            "agent": "coordinator",
+                            "kind": "brief",
+                            "time": "2026-11-25T08:01:00Z",
+                            "text": "@worker-a go",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                c_log = brain / c_cid / ".system_generated" / "logs"
+                c_log.mkdir(parents=True)
+                c_tr = c_log / "transcript.jsonl"
+                c_tr.write_text(
+                    json.dumps(
+                        {
+                            "type": "PLANNER_RESPONSE",
+                            "status": "DONE",
+                            "model": "gemini-4-neon",
+                            "created_at": "2026-11-25T08:02:00Z",
+                            "content": "Sleeping on board",
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.utime(c_tr, (coord_mtime, coord_mtime))
+                os.utime(sdir / "members.json", (coord_mtime, coord_mtime))
+
+                w_log = brain / w_cid / ".system_generated" / "logs"
+                w_log.mkdir(parents=True)
+                w_tr = w_log / "transcript.jsonl"
+                if worker_state == "done":
+                    w_tr.write_text(
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "status": "DONE",
+                                "model": "gemini-4-neon",
+                                "created_at": "2026-11-25T08:03:00Z",
+                                "content": "Finished task",
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    w_tr.write_text(
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "status": "DONE",
+                                "model": "gemini-4-neon",
+                                "created_at": "2026-11-25T08:03:00Z",
+                                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "pytest"}}],
+                            }
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                os.utime(w_tr, (worker_mtime, worker_mtime))
+
+            _make_swarm("stale-coord", "done", stale_ts, stale_ts)
+            _make_swarm("fresh-coord", "done", fresh_ts, stale_ts)
+            _make_swarm("active-worker", "running", stale_ts, now_ts - 30.0)
+
+            flows = discover_swarms(brain_roots=[brain], now_ts=now_ts)
+            by_id = {f["id"]: {a["id"]: a for a in f["agents"]} for f in flows}
+            self.assertEqual(by_id["agy:stale-coord"]["coordinator"]["state"], "done")
+            self.assertEqual(by_id["agy:fresh-coord"]["coordinator"]["state"], "waiting")
+            self.assertEqual(by_id["agy:active-worker"]["coordinator"]["state"], "waiting")
+
 
 class T3DelegationsAdapterTests(unittest.TestCase):
     def test_t3_depth2_mixed_labs_ro_file_and_lazy_loaders(self) -> None:
@@ -745,6 +904,211 @@ class T3DelegationsAdapterTests(unittest.TestCase):
             self.assertEqual(by_id["node:cont-cl"]["trace"], [])
             self.assertNotIn("cacheRead", by_id["node:cont-cl"])
 
+    def test_standalone_live_thread_emitted_and_archived_deleted_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proj = root / "proj"
+            proj.mkdir()
+            db_path = root / "statev2.sqlite"
+            _create_mock_t3_db(db_path)
+
+            con = sqlite3.connect(str(db_path))
+            con.execute("INSERT INTO projection_projects VALUES ('p1', 'DemoProj', ?)", (str(proj),))
+            for tid, title, arch, deleted in (
+                ("live-ok", "Standalone Live", None, None),
+                ("live-arch", "Archived Live", "2026-11-25T11:00:00Z", None),
+                ("live-del", "Deleted Live", None, "2026-11-25T11:00:00Z"),
+            ):
+                con.execute(
+                    "INSERT INTO orchestration_v2_projection_threads VALUES (?, 'p1', ?, 'anthropic', 'anthropic', NULL, '2026-11-25T10:00:00Z', '2026-11-25T10:05:00Z', ?, ?, ?)",
+                    (tid, title, arch, deleted, json.dumps({"lineage": {"rootThreadId": tid}, "modelSelection": {"model": "claude-opus-5-5"}})),
+                )
+                con.execute(
+                    "INSERT INTO orchestration_v2_projection_runs VALUES (?, ?, 'running')",
+                    (f"run-{tid}", tid),
+                )
+            con.commit()
+            con.close()
+
+            flows = discover_t3_flows(
+                db_path=db_path,
+                env_id="env-1",
+                brain_roots=[],
+                grok_sessions_root=root / "no-grok",
+            )
+            self.assertEqual(len(flows), 1)
+            flow = flows[0]
+            _assert_flow_invariants(self, flow)
+            self.assertEqual(flow["id"], "t3:live-ok")
+            self.assertEqual(flow["kind"], "thread")
+            self.assertEqual(len(flow["agents"]), 1)
+            self.assertEqual(flow["agents"][0]["state"], "running")
+
+    def test_live_delegation_tree_prioritized_ahead_of_limit_trees_cutoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proj = root / "proj"
+            proj.mkdir()
+            db_path = root / "statev2.sqlite"
+            _create_mock_t3_db(db_path)
+
+            con = sqlite3.connect(str(db_path))
+            con.execute("INSERT INTO projection_projects VALUES ('p1', 'Proj', ?)", (str(proj),))
+            # 3 newer completed trees vs 1 older live tree
+            trees = [
+                ("tree-done-1", "2026-11-25T12:00:00Z", "completed", False),
+                ("tree-done-2", "2026-11-25T12:01:00Z", "completed", False),
+                ("tree-done-3", "2026-11-25T12:02:00Z", "completed", False),
+                ("tree-old-live", "2026-11-25T08:00:00Z", "running", True),
+            ]
+            for rtid, ts, status, is_live in trees:
+                ctid = f"{rtid}-child"
+                con.execute(
+                    "INSERT INTO orchestration_v2_projection_threads VALUES (?, 'p1', ?, 'claude', 'claude', NULL, ?, ?, NULL, NULL, ?)",
+                    (rtid, rtid, ts, ts, json.dumps({"lineage": {"rootThreadId": rtid}})),
+                )
+                con.execute(
+                    "INSERT INTO orchestration_v2_projection_threads VALUES (?, 'p1', ?, 'claude', 'claude', NULL, ?, ?, NULL, NULL, ?)",
+                    (ctid, ctid, ts, ts, json.dumps({"lineage": {"rootThreadId": rtid, "parentThreadId": rtid}})),
+                )
+                con.execute(
+                    "INSERT INTO orchestration_v2_projection_subagents VALUES (?, ?, 'r', 'n', 'claude', 'claude', 'claude', NULL, ?, 'delegate', ?, ?, ?, ?, ?)",
+                    (f"sub-{rtid}", rtid, ctid, status, ts, None if is_live else ts, ts, json.dumps({"title": "Worker", "role": "worker"})),
+                )
+                if is_live:
+                    con.execute("INSERT INTO orchestration_v2_projection_runs VALUES ('run-old', ?, 'running')", (ctid,))
+            con.commit()
+            con.close()
+
+            flows = discover_t3_flows(
+                db_path=db_path,
+                env_id="env-1",
+                limit_trees=2,
+                brain_roots=[],
+                grok_sessions_root=root / "no-grok",
+            )
+            fids = [f["id"] for f in flows]
+            self.assertEqual(len(fids), 2)
+            self.assertIn("t3:tree-old-live", fids)
+            self.assertIn("t3:tree-done-3", fids)
+
+    def test_discover_active_threads_schema_child_counts_filters_and_live_first_sorting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proj = root / "proj"
+            proj.mkdir()
+            db_path = root / "statev2.sqlite"
+            _create_mock_t3_db(db_path)
+
+            con = sqlite3.connect(str(db_path))
+            con.execute("ALTER TABLE orchestration_v2_projection_runs ADD COLUMN ordinal INTEGER")
+            con.execute("ALTER TABLE orchestration_v2_projection_runs ADD COLUMN requested_at TEXT")
+            con.execute("INSERT INTO projection_projects VALUES ('p1', 'ActiveProj', ?)", (str(proj),))
+
+            # 1. Live running delegation root (updated 11:32) with 1 running + 1 completed child
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-run', 'p1', 'Running Root', 'antigravity', 'antigravity', NULL, '2026-11-25T11:20:00Z', '2026-11-25T11:32:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-run"}, "modelSelection": {"model": "gemini-4-neon"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-1', 'thr-run', 'running', 1, '2026-11-25T11:25:00Z')"
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('child-live', 'p1', 'Child Live', 'claude', 'claude', NULL, '2026-11-25T11:26:00Z', '2026-11-25T11:30:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-run", "parentThreadId": "thr-run"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('child-done', 'p1', 'Child Done', 'claude', 'claude', NULL, '2026-11-25T11:26:00Z', '2026-11-25T11:28:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-run", "parentThreadId": "thr-run"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_subagents VALUES ('sub-live', 'thr-run', 'run-1', 'n1', 'claude', 'claude', 'claude', NULL, 'child-live', 'delegate', 'running', '2026-11-25T11:26:00Z', NULL, '2026-11-25T11:30:00Z', '{}')"
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_subagents VALUES ('sub-done', 'thr-run', 'run-1', 'n2', 'claude', 'claude', 'claude', NULL, 'child-done', 'delegate', 'completed', '2026-11-25T11:26:00Z', '2026-11-25T11:28:00Z', '2026-11-25T11:28:00Z', '{}')"
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-c1', 'child-live', 'running', 1, '2026-11-25T11:26:00Z')"
+            )
+
+            # 2. Standalone waiting thread (updated 11:55 -> newer than thr-run, must sort AFTER running)
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-wait', 'p1', 'Waiting Standalone', 'claude', 'claude', NULL, '2026-11-25T11:50:00Z', '2026-11-25T11:55:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-wait"}, "modelSelection": {"model": "claude-opus-5-5"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-wait', 'thr-wait', 'waiting', 1, '2026-11-25T11:52:00Z')"
+            )
+
+            # 3. Recent unsettled top-level thread (2h old, no subagents -> flowId=None)
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-unsettled', 'p1', 'Recent Unsettled', 'openai', 'openai', NULL, '2026-11-25T09:50:00Z', '2026-11-25T10:00:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-unsettled"}, "modelSelection": {"model": "gpt-6"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-u1', 'thr-unsettled', 'completed', 1, '2026-11-25T09:50:00Z')"
+            )
+
+            # 4. Excluded threads: settled, >48h old, non-live child, archived live, deleted live
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-settled', 'p1', 'Settled', 'claude', 'claude', NULL, '2026-11-25T10:30:00Z', '2026-11-25T11:00:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-settled"}, "settledAt": "2026-11-25T11:05:00Z"}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-old', 'p1', 'Old Unsettled', 'claude', 'claude', NULL, '2026-11-22T09:00:00Z', '2026-11-22T10:00:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-old"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-child-idle', 'p1', 'Idle Child', 'claude', 'claude', NULL, '2026-11-25T10:50:00Z', '2026-11-25T11:00:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-unsettled", "parentThreadId": "thr-unsettled"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-arch-live', 'p1', 'Archived Live', 'claude', 'claude', NULL, '2026-11-25T11:50:00Z', '2026-11-25T11:55:00Z', '2026-11-25T11:56:00Z', NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-arch-live"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-arch', 'thr-arch-live', 'running', 1, '2026-11-25T11:50:00Z')"
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-del-live', 'p1', 'Deleted Live', 'claude', 'claude', NULL, '2026-11-25T11:50:00Z', '2026-11-25T11:55:00Z', NULL, '2026-11-25T11:56:00Z', ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-del-live"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-del', 'thr-del-live', 'running', 1, '2026-11-25T11:50:00Z')"
+            )
+            con.commit()
+            con.close()
+
+            now_ts = datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+            items = discover_active_threads(
+                db_path=db_path,
+                env_id="env-1",
+                brain_roots=[],
+                grok_sessions_root=root / "no-grok",
+                now_ts=now_ts,
+            )
+            for item in items:
+                self.assertEqual(set(item.keys()), EXPECTED_ACTIVE_THREAD_KEYS)
+                self.assertIn(item["state"], VALID_STATES)
+
+            ids = [t["id"] for t in items]
+            # Live running root, live running child, live waiting standalone, then unsettled done
+            self.assertEqual(ids, ["thr-run", "child-live", "thr-wait", "thr-unsettled"])
+            by_id = {t["id"]: t for t in items}
+            self.assertTrue(by_id["thr-run"]["isLive"])
+            self.assertEqual(by_id["thr-run"]["activeChildren"], 1)
+            self.assertEqual(by_id["thr-run"]["totalChildren"], 2)
+            self.assertEqual(by_id["thr-run"]["flowId"], "t3:thr-run")
+            self.assertEqual(by_id["thr-run"]["href"], "t3-thread://v2/env-1/thr-run")
+
+            self.assertTrue(by_id["thr-wait"]["isLive"])
+            self.assertEqual(by_id["thr-wait"]["state"], "waiting")
+            self.assertEqual(by_id["thr-wait"]["flowId"], "t3:thr-wait")
+
+            self.assertFalse(by_id["thr-unsettled"]["isLive"])
+            self.assertFalse(by_id["thr-unsettled"]["settled"])
+            self.assertIsNone(by_id["thr-unsettled"]["flowId"])
+
 
 class HarnessAndCliAdapterTests(unittest.TestCase):
     def test_committee_orchestrate_and_ledger_dedup(self) -> None:
@@ -959,6 +1323,139 @@ class HarnessAndCliAdapterTests(unittest.TestCase):
             self.assertEqual(c_sub["cacheRead"], 120)
             self.assertEqual(sum(c for _, c in c_sub["trace"]), 2)
 
+    def test_harness_stale_detection_committee_and_orchestrate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now_ts = 1795612000.0
+            stale_mtime = now_ts - HARNESS_STALE_THRESHOLD_S - 300.0
+            fresh_mtime = now_ts - 60.0
+
+            c_dir = root / "committee"
+            o_dir = root / "orchestrate"
+
+            # Stale committee brief without .out.json
+            c_stale = c_dir / "stale-run"
+            c_stale.mkdir(parents=True)
+            (c_stale / "committee.resolved.json").write_text(
+                json.dumps(
+                    {
+                        "question": "Stale test",
+                        "members": [
+                            {"id": "committee-1", "seat": 1, "model": "claude-opus-5", "route": {"cli": "claude"}},
+                            {"id": "committee-2", "seat": 2, "model": "gpt-6", "route": {"cli": "codex"}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (c_stale / "committee-1.md").write_text("Brief 1", encoding="utf-8")
+            (c_stale / "committee-2.md").write_text("Brief 2", encoding="utf-8")
+            (c_stale / "committee-2.out.json").write_text(
+                json.dumps({"status": "success", "cli": "codex", "response": "**PASS**"}),
+                encoding="utf-8",
+            )
+            os.utime(c_stale / "committee-1.md", (stale_mtime, stale_mtime))
+
+            # Fresh committee brief without .out.json stays running
+            c_fresh = c_dir / "fresh-run"
+            c_fresh.mkdir(parents=True)
+            (c_fresh / "committee.resolved.json").write_text(
+                json.dumps(
+                    {
+                        "question": "Fresh test",
+                        "members": [
+                            {"id": "committee-1", "seat": 1, "model": "claude-opus-5", "route": {"cli": "claude"}},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (c_fresh / "committee-1.md").write_text("Brief fresh", encoding="utf-8")
+            os.utime(c_fresh / "committee-1.md", (fresh_mtime, fresh_mtime))
+
+            # Orchestrate with one stale task and one fresh running task
+            o_run = o_dir / "orch-stale"
+            o_run.mkdir(parents=True)
+            (o_run / "plan.resolved.json").write_text(
+                json.dumps(
+                    {
+                        "goal": "Check stale",
+                        "tasks": [
+                            {"id": "t_stale", "title": "Stale Task", "model": "claude-opus-5"},
+                            {"id": "t_fresh", "title": "Fresh Task", "model": "gpt-6"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (o_run / "t_stale.md").write_text("Old brief", encoding="utf-8")
+            (o_run / "t_fresh.md").write_text("Fresh brief", encoding="utf-8")
+            os.utime(o_run / "t_stale.md", (stale_mtime, stale_mtime))
+            os.utime(o_run / "t_fresh.md", (fresh_mtime, fresh_mtime))
+
+            flows = discover_harness_runs(
+                committee_dir=c_dir,
+                orchestrate_dir=o_dir,
+                sessions_ledger=root / "none.jsonl",
+                grok_sessions_root=root / "none-grok",
+                now_ts=now_ts,
+            )
+            by_id = {f["id"]: {a["id"]: a for a in f["agents"]} for f in flows}
+            self.assertEqual(by_id["committee:stale-run"]["committee-1"]["state"], "stale")
+            self.assertEqual(by_id["committee:stale-run"]["committee-2"]["state"], "done")
+            self.assertEqual(by_id["committee:fresh-run"]["committee-1"]["state"], "running")
+            self.assertEqual(by_id["orchestrate:orch-stale"]["t_stale"]["state"], "stale")
+            self.assertEqual(by_id["orchestrate:orch-stale"]["t_fresh"]["state"], "running")
+
+    def test_claude_team_stale_vs_fresh_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now_ts = 1795612000.0
+            stale_mtime = now_ts - CLAUDE_STALE_THRESHOLD_S - 120.0
+            fresh_mtime = now_ts - 60.0
+
+            cl_root = root / "claude"
+            for name, mtime in (("stale-team", stale_mtime), ("fresh-team", fresh_mtime)):
+                tdir = cl_root / "teams" / name
+                tdir.mkdir(parents=True)
+                task_dir = cl_root / "tasks" / name
+                task_dir.mkdir(parents=True)
+                cfg_p = tdir / "config.json"
+                cfg_p.write_text(
+                    json.dumps(
+                        {
+                            "name": name,
+                            "description": f"Team {name}",
+                            "leadAgentId": "w-1",
+                            "members": [
+                                {
+                                    "agentId": "w-1",
+                                    "name": "worker",
+                                    "agentType": "worker",
+                                    "model": "claude-opus-5",
+                                    "status": "running",
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                task_p = task_dir / "1.json"
+                task_p.write_text(json.dumps({"owner": "worker", "subject": "Work"}), encoding="utf-8")
+                os.utime(task_p, (mtime, mtime))
+                os.utime(cfg_p, (mtime, mtime))
+
+            flows = discover_cli_flows(
+                grok_sessions_root=root / "no-grok",
+                codex_db_path=root / "no-codex.sqlite",
+                claude_root=cl_root,
+                dropin_dir=root / "no-drop",
+                now_ts=now_ts,
+            )
+            by_id = {f["id"]: f for f in flows}
+            self.assertEqual(by_id["claude-team:stale-team"]["agents"][0]["state"], "stale")
+            self.assertEqual(by_id["claude-team:fresh-team"]["agents"][0]["state"], "running")
+
 
 class BoardRegistryIntegrationTests(unittest.TestCase):
     def test_registry_sorting_fault_isolation_outputs_citations_and_digest(self) -> None:
@@ -1147,6 +1644,136 @@ class BoardRegistryIntegrationTests(unittest.TestCase):
             grok_tr = reg.get_output(grok_flow["id"], grok_flow["outputs"][0]["id"])
             self.assertTrue(grok_tr["ok"])
             self.assertEqual(grok_tr["messages"][0]["content"], "Grok reply")
+
+    def test_flow_sort_key_order_running_waiting_queued_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dropin = root / "dropin"
+            dropin.mkdir()
+            specs = [
+                ("done-newest", "2026-11-25T12:00:00Z", "done"),
+                ("queued-mid", "2026-11-25T10:00:00Z", "queued"),
+                ("waiting-newer", "2026-11-25T11:00:00Z", "waiting"),
+                ("running-oldest", "2026-11-25T08:00:00Z", "running"),
+            ]
+            for fid, upd, state in specs:
+                (dropin / f"{fid}.json").write_text(
+                    json.dumps(
+                        {
+                            "id": f"dropin:{fid}",
+                            "title": fid,
+                            "updatedAt": upd,
+                            "agents": [{"id": "a1", "name": "A1", "state": state}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            reg = BoardRegistry(
+                {
+                    "committee_dir": root / "no-com",
+                    "orchestrate_dir": root / "no-orch",
+                    "sessions_ledger": root / "no-ledger",
+                    "grok_sessions_root": root / "no-grok",
+                    "codex_db": root / "no-codex",
+                    "claude_root": root / "no-claude",
+                    "brain_roots": [],
+                    "statev2_db": root / "no-t3.sqlite",
+                    "dropin_dir": dropin,
+                    "rates_path": root / "no-rates.json",
+                    "usage_cache_path": root / "no-usage.json",
+                },
+                cache_ttl_s=0.0,
+            )
+            flows = reg.list_flows(force=True)
+            self.assertEqual(
+                [f["id"] for f in flows],
+                [
+                    "dropin:running-oldest",
+                    "dropin:waiting-newer",
+                    "dropin:queued-mid",
+                    "dropin:done-newest",
+                ],
+            )
+
+    def test_registry_active_threads_active_count_and_standalone_t3_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proj = root / "proj"
+            proj.mkdir()
+            db_path = root / "statev2.sqlite"
+            _create_mock_t3_db(db_path)
+
+            con = sqlite3.connect(str(db_path))
+            con.execute("INSERT INTO projection_projects VALUES ('p1', 'Proj', ?)", (str(proj),))
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thr-solo', 'p1', 'Solo Live', 'claude', 'claude', NULL, '2026-11-25T11:50:00Z', '2026-11-25T11:55:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "thr-solo"}, "modelSelection": {"model": "claude-opus-5-5"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_runs VALUES ('run-solo', 'thr-solo', 'running')"
+            )
+            con.commit()
+            con.close()
+
+            dropin = root / "dropin"
+            dropin.mkdir()
+            (dropin / "live-dropin.json").write_text(
+                json.dumps(
+                    {
+                        "id": "dropin:live-1",
+                        "title": "Live Dropin",
+                        "startedAt": "2026-11-25T11:40:00Z",
+                        "updatedAt": "2026-11-25T11:45:00Z",
+                        "agents": [{"id": "w1", "name": "W1", "lab": "openai", "model": "gpt-6", "state": "waiting"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            now_ts = datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+            reg = BoardRegistry(
+                {
+                    "committee_dir": root / "no-com",
+                    "orchestrate_dir": root / "no-orch",
+                    "sessions_ledger": root / "no-ledger",
+                    "grok_sessions_root": root / "no-grok",
+                    "codex_db": root / "no-codex",
+                    "claude_root": root / "no-claude",
+                    "brain_roots": [],
+                    "statev2_db": db_path,
+                    "env_id": "env-reg",
+                    "dropin_dir": dropin,
+                    "rates_path": root / "no-rates.json",
+                    "usage_cache_path": root / "no-usage.json",
+                    "now_ts": now_ts,
+                },
+                cache_ttl_s=0.0,
+            )
+            self.addCleanup(reg.close)
+            self.assertFalse(reg._has_snapshot)
+            self.assertEqual(reg.get_active_count(), 0)
+
+            active = reg.list_active_threads(force=True)
+            self.assertEqual(len(active), 2)
+            for item in active:
+                self.assertEqual(set(item.keys()), EXPECTED_ACTIVE_THREAD_KEYS)
+            self.assertEqual(reg.get_active_count(), 2)
+
+            d1 = reg.snapshot_digest()
+            con = sqlite3.connect(str(db_path))
+            con.execute("UPDATE orchestration_v2_projection_runs SET status = 'waiting' WHERE run_id = 'run-solo'")
+            con.commit()
+            con.close()
+            d2 = reg.snapshot_digest()
+            self.assertNotEqual(d1, d2)
+
+            con = sqlite3.connect(str(db_path))
+            con.execute("UPDATE orchestration_v2_projection_runs SET status = 'completed' WHERE run_id = 'run-solo'")
+            con.commit()
+            con.close()
+            d3 = reg.snapshot_digest()
+            self.assertNotEqual(d2, d3)
+            self.assertEqual(reg.get_active_count(), 1)
 
 
 if __name__ == "__main__":

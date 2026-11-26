@@ -29,7 +29,7 @@ import time
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .adapters import BoardRegistry
+from .adapters import BoardRegistry, _active_thread_sort_key, _live_flow_to_active_thread
 from .safety import is_path_allowed, redact_if_secret_name
 
 SERVER_VERSION = "0.3.0"
@@ -38,8 +38,9 @@ TAILSCALE_CGNAT_NET = ipaddress.IPv4Network("100.64.0.0/10")
 DEFAULT_PORT = 18420
 PORT_SCAN_END = 18449
 DEFAULT_IDLE_SECONDS = 7200.0
-DEFAULT_SSE_POLL_S = 2.0
+DEFAULT_SSE_POLL_S = 2.5
 DEFAULT_SSE_HEARTBEAT_S = 20.0
+_SSE_MAX_CONSECUTIVE_DROPS = 32
 _STREAM_CHUNK_BYTES = 65_536
 _ENSURE_TIMEOUT_S = 5.0
 _HEALTH_PROBE_TIMEOUT_S = 0.4
@@ -252,6 +253,32 @@ def resolve_bind_host(
     raise ValueError(
         f"Refusing to bind non-loopback, non-Tailscale IPv4 address: {raw}"
     )
+
+
+def resolve_port(
+    port: int | None = None,
+    *,
+    use_env: bool = True,
+) -> int | None:
+    """Resolve explicit or SWARM_BOARD_PORT port override (None means default port scan)."""
+    if port is not None:
+        if isinstance(port, bool):
+            raise ValueError(f"Invalid port value: {port!r}")
+        p = int(port)
+        if p < 0 or p > 65535:
+            raise ValueError(f"Port out of range (0..65535): {p}")
+        return p
+    if use_env:
+        raw = os.environ.get("SWARM_BOARD_PORT", "").strip()
+        if raw:
+            try:
+                p = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"Invalid SWARM_BOARD_PORT value: {raw!r}") from exc
+            if p < 0 or p > 65535:
+                raise ValueError(f"SWARM_BOARD_PORT out of range (0..65535): {p}")
+            return p
+    return None
 
 
 def resolve_open_in_preview(
@@ -637,6 +664,46 @@ def _resolve_env_id(registry: Any) -> str | None:
         return None
 
 
+def _derive_live_threads_from_flows(flows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fallback active-thread derivation when a registry mock does not implement list_active_threads."""
+    out: list[dict[str, Any]] = []
+    for flow in flows:
+        if not isinstance(flow, dict):
+            continue
+        item = _live_flow_to_active_thread(flow)
+        if item is not None:
+            out.append(item)
+    out.sort(key=_active_thread_sort_key)
+    return out
+
+
+def _resolve_active_threads(registry: Any, *, force: bool = False) -> list[dict[str, Any]]:
+    """Return active threads via registry.list_active_threads or live-flow fallback."""
+    list_active = getattr(registry, "list_active_threads", None)
+    if callable(list_active):
+        res = list_active(force=force)
+        return list(res) if isinstance(res, list) else []
+    flows = registry.list_flows(force=force)
+    return _derive_live_threads_from_flows(flows if isinstance(flows, list) else ())
+
+
+def _count_active_from_registry(registry: Any, flows: Iterable[dict[str, Any]] | None = None) -> int:
+    """Return current live active count using registry helpers or flow fallback."""
+    get_ac = getattr(registry, "get_active_count", None)
+    if callable(get_ac):
+        return int(get_ac())
+    list_active = getattr(registry, "list_active_threads", None)
+    if callable(list_active):
+        return sum(
+            1
+            for t in (list_active(force=False) or ())
+            if isinstance(t, dict) and t.get("isLive")
+        )
+    if flows is None:
+        flows = registry.list_flows(force=False)
+    return len(_derive_live_threads_from_flows(flows if isinstance(flows, Iterable) else ()))
+
+
 class SSEHub:
     """Single shared background digest poller active ONLY while >= 1 SSE client is connected."""
 
@@ -652,6 +719,7 @@ class SSEHub:
         self._on_empty_callback = on_empty_callback
         self._lock = threading.Lock()
         self._clients: set[queue.Queue[bytes | None]] = set()
+        self._client_drops: dict[queue.Queue[bytes | None], int] = {}
         self._poller_thread: threading.Thread | None = None
         self._poller_stop: threading.Event | None = None
         self._last_digest: str | None = None
@@ -675,6 +743,7 @@ class SSEHub:
                 return None
             was_empty = len(self._clients) == 0
             self._clients.add(client_q)
+            self._client_drops[client_q] = 0
             if was_empty or self._last_digest is None:
                 self._last_digest = initial_digest
             if self._poller_thread is None or not self._poller_thread.is_alive():
@@ -694,6 +763,7 @@ class SSEHub:
         """Unregister an SSE client and stop the shared poller immediately when count hits 0."""
         became_empty = False
         with self._lock:
+            self._client_drops.pop(client_q, None)
             if client_q in self._clients:
                 self._clients.remove(client_q)
                 became_empty = len(self._clients) == 0
@@ -709,9 +779,13 @@ class SSEHub:
     def _enqueue_to_clients(self, payload: bytes | None) -> None:
         with self._lock:
             targets = list(self._clients)
+        stale_clients: list[queue.Queue[bytes | None]] = []
         for q in targets:
             try:
                 q.put_nowait(payload)
+                with self._lock:
+                    if q in self._client_drops:
+                        self._client_drops[q] = 0
             except queue.Full:
                 try:
                     q.get_nowait()
@@ -721,6 +795,23 @@ class SSEHub:
                     q.put_nowait(payload)
                 except queue.Full:
                     pass
+                with self._lock:
+                    if q in self._clients:
+                        drops = self._client_drops.get(q, 0) + 1
+                        self._client_drops[q] = drops
+                        if drops >= _SSE_MAX_CONSECUTIVE_DROPS:
+                            stale_clients.append(q)
+        for dead_q in stale_clients:
+            while True:
+                try:
+                    dead_q.put_nowait(None)
+                    break
+                except queue.Full:
+                    try:
+                        dead_q.get_nowait()
+                    except queue.Empty:
+                        break
+            self.unregister(dead_q)
 
     def _poll_loop(self, stop_ev: threading.Event) -> None:
         while not stop_ev.wait(self.poll_interval_s):
@@ -752,6 +843,7 @@ class SSEHub:
             thread = self._poller_thread
             self._poller_thread = None
             targets = list(self._clients)
+            self._client_drops.clear()
         for q in targets:
             while True:
                 try:
@@ -870,6 +962,8 @@ class SwarmBoardRequestHandler(BaseHTTPRequestHandler):
                 self._serve_health(head_only=head_only)
             elif raw_path == "/api/flows":
                 self._serve_flows(params, head_only=head_only)
+            elif raw_path == "/api/active":
+                self._serve_active(params, head_only=head_only)
             elif len(segments) == 3 and segments[0] == "api" and segments[1] == "flow":
                 self._serve_single_flow(segments[2], head_only=head_only)
             elif raw_path == "/api/stats":
@@ -946,6 +1040,7 @@ class SwarmBoardRequestHandler(BaseHTTPRequestHandler):
             "idle_seconds": self.server.idle_seconds,
             "clients": self.server.sse_hub.client_count(),
             "flows_count": self.server.get_flows_count(),
+            "activeCount": self.server.get_active_count(),
             "version": SERVER_VERSION,
         }
         self._send_json(200, payload, head_only=head_only)
@@ -960,6 +1055,22 @@ class SwarmBoardRequestHandler(BaseHTTPRequestHandler):
             "envId": _resolve_env_id(reg),
             "snapshot": _format_snapshot_time(),
             "flows": flows,
+            "activeCount": _count_active_from_registry(reg, flows),
+            "errors": dict(getattr(reg, "last_errors", {}) or {}),
+        }
+        self._send_json(200, payload, head_only=head_only)
+
+    def _serve_active(self, params: dict[str, list[str]], *, head_only: bool) -> None:
+        force_raw = (params.get("force", [""])[0] or "").strip().lower()
+        force = force_raw in ("1", "true", "yes")
+        reg = self.server.registry
+        threads = _resolve_active_threads(reg, force=force)
+        payload = {
+            "ok": True,
+            "envId": _resolve_env_id(reg),
+            "snapshot": _format_snapshot_time(),
+            "threads": threads,
+            "liveCount": sum(1 for t in threads if isinstance(t, dict) and t.get("isLive")),
             "errors": dict(getattr(reg, "last_errors", {}) or {}),
         }
         self._send_json(200, payload, head_only=head_only)
@@ -1197,11 +1308,15 @@ class SwarmBoardRequestHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
         try:
+            heartbeat_s = self.server.sse_heartbeat_interval_s
+            try:
+                self.connection.settimeout(max(10.0, heartbeat_s + 5.0))
+            except OSError:
+                pass
             ready_frame = _format_sse_event("ready", {"digest": initial_digest, "ts": time.time()})
             self.wfile.write(ready_frame)
             self.wfile.flush()
 
-            heartbeat_s = self.server.sse_heartbeat_interval_s
             while not self.server.is_shutting_down():
                 try:
                     frame = client_q.get(timeout=heartbeat_s)
@@ -1252,6 +1367,9 @@ class _LoopbackCompanionServer(ThreadingHTTPServer):
     def get_flows_count(self) -> int:
         return self._primary.get_flows_count()
 
+    def get_active_count(self) -> int:
+        return self._primary.get_active_count()
+
     def serve_forever(self, poll_interval: float = 0.5) -> None:
         self._serving_started.set()
         super().serve_forever(poll_interval=poll_interval)
@@ -1285,6 +1403,7 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
         self._watchdog_thread: threading.Thread | None = None
         self._companion: _LoopbackCompanionServer | None = None
         self._companion_thread: threading.Thread | None = None
+        self._close_registry_on_close = True
 
         bind_ip = str(server_address[0]).strip() or BIND_HOST
         hosts: set[str] = {bind_ip.lower()}
@@ -1376,6 +1495,30 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
         except Exception:  # noqa: BLE001
             return 0
 
+    def get_active_count(self) -> int:
+        """Return current known active thread count without stalling /health on a cold scan."""
+        reg = self.registry
+        if hasattr(reg, "_has_snapshot") and not getattr(reg, "_has_snapshot", False):
+            return 0
+        get_ac = getattr(reg, "get_active_count", None)
+        if callable(get_ac):
+            try:
+                return int(get_ac())
+            except Exception:  # noqa: BLE001
+                return 0
+        if hasattr(reg, "_cached_active_threads"):
+            lock = getattr(reg, "_lock", None)
+            if lock is not None:
+                with lock:
+                    active = getattr(reg, "_cached_active_threads", []) or ()
+                    return sum(1 for t in active if isinstance(t, dict) and t.get("isLive"))
+            active = getattr(reg, "_cached_active_threads", []) or ()
+            return sum(1 for t in active if isinstance(t, dict) and t.get("isLive"))
+        try:
+            return _count_active_from_registry(reg)
+        except Exception:  # noqa: BLE001
+            return 0
+
     def request_shutdown(self) -> None:
         """Trigger graceful server shutdown safely from another thread."""
         if self._shutdown_event.is_set():
@@ -1415,6 +1558,13 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
                 self._companion.server_close()
             except OSError:
                 pass
+        if self._close_registry_on_close:
+            close_reg = getattr(self.registry, "close", None)
+            if callable(close_reg):
+                try:
+                    close_reg()
+                except Exception:  # noqa: BLE001
+                    pass
         super().server_close()
 
 
@@ -1431,14 +1581,11 @@ def _bind_server_socket(
 ) -> SwarmBoardHTTPServer:
     """Create and bind SwarmBoardHTTPServer strictly on loopback or Tailscale+loopback."""
     bind_host = resolve_bind_host(host, use_env_and_config=False)
-    if port is not None:
-        candidate_ports = [int(port)]
+    resolved_port = resolve_port(port, use_env=True)
+    if resolved_port is not None:
+        candidate_ports = [resolved_port]
     else:
-        env_port = os.environ.get("SWARM_BOARD_PORT", "").strip()
-        if env_port:
-            candidate_ports = [int(env_port)]
-        else:
-            candidate_ports = list(range(DEFAULT_PORT, PORT_SCAN_END + 1))
+        candidate_ports = list(range(DEFAULT_PORT, PORT_SCAN_END + 1))
 
     last_err: OSError | None = None
     for candidate in candidate_ports:
@@ -1457,6 +1604,7 @@ def _bind_server_socket(
                     companion = _LoopbackCompanionServer((BIND_HOST, primary.bound_port), primary)
                 except OSError as exc:
                     last_err = exc
+                    primary._close_registry_on_close = False
                     primary.server_close()
                     if exc.errno == errno.EADDRINUSE and attempt < 9:
                         continue
@@ -1482,6 +1630,7 @@ def _bind_server_socket(
             return primary
         except OSError as exc:
             if primary is not None:
+                primary._close_registry_on_close = False
                 primary.server_close()
             last_err = exc
             if len(candidate_ports) == 1 or exc.errno not in (errno.EADDRINUSE, errno.EACCES):
@@ -1544,15 +1693,32 @@ def _remove_server_json_if_owner(state_file: Path, pid: int) -> None:
 def _is_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    # Reap exited child processes spawned by this Python process so zombies do not look alive.
+    try:
+        wpid, _ = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            return False
+    except (ChildProcessError, OSError):
+        pass
     try:
         os.kill(pid, 0)
-        return True
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
     except OSError:
         return False
+    if sys.platform.startswith("linux"):
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+            rparen = stat_text.rfind(")")
+            if rparen != -1:
+                fields = stat_text[rparen + 2 :].split()
+                if fields and fields[0] == "Z":
+                    return False
+        except OSError:
+            return False
+    return True
 
 
 def _probe_health(
@@ -1704,8 +1870,9 @@ def _try_reuse_existing(
     requested_port: int | None,
     timeout: float,
     config: dict[str, Any] | None = None,
+    fallback_default_port: bool = False,
 ) -> dict[str, Any] | None:
-    """Check server.json (and explicit port if > 0) for a live healthy server on requested_host."""
+    """Check server.json (and explicit/fallback port) for a live healthy server on requested_host."""
     data = _read_json_file(state_file)
     if data is not None:
         entry_port = data.get("port")
@@ -1730,21 +1897,28 @@ def _try_reuse_existing(
                     "open_in_preview": resolve_open_in_preview(resp_host, config=config),
                 }
 
+    probe_port: int | None = None
     if requested_port is not None and requested_port > 0:
-        health = _probe_health(requested_port, host=requested_host, timeout=timeout)
+        probe_port = requested_port
+    elif data is None and requested_port is None and fallback_default_port:
+        probe_port = DEFAULT_PORT
+
+    if probe_port is not None:
+        health = _probe_health(probe_port, host=requested_host, timeout=timeout)
         if health is not None:
-            port = int(health["port"])
             resp_host = str(health.get("host") or requested_host)
-            return {
-                "ok": True,
-                "host": resp_host,
-                "port": port,
-                "url": f"http://{resp_host}:{port}",
-                "local_url": f"http://{BIND_HOST}:{port}",
-                "pid": int(health["pid"]),
-                "started": False,
-                "open_in_preview": resolve_open_in_preview(resp_host, config=config),
-            }
+            if resp_host == requested_host:
+                port = int(health["port"])
+                return {
+                    "ok": True,
+                    "host": resp_host,
+                    "port": port,
+                    "url": f"http://{resp_host}:{port}",
+                    "local_url": f"http://{BIND_HOST}:{port}",
+                    "pid": int(health["pid"]),
+                    "started": False,
+                    "open_in_preview": resolve_open_in_preview(resp_host, config=config),
+                }
     return None
 
 
@@ -1807,6 +1981,7 @@ def ensure_server(
     """Ensure a single Swarm Board server instance is healthy, spawning detached if needed."""
     cfg = load_user_config()
     target_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
+    resolved_port = resolve_port(port, use_env=True)
     resolved_idle = resolve_idle_seconds(idle_seconds, use_env_and_config=True, config=cfg)
 
     resolved_state = get_state_dir(state_dir)
@@ -1814,6 +1989,8 @@ def ensure_server(
     lock_path = resolved_state / "ensure.lock"
     state_file = resolved_state / "server.json"
     starting_file = resolved_state / "starting.json"
+    using_default_state = state_dir is None and not os.environ.get("SWARM_BOARD_STATE_DIR", "").strip()
+    fallback_default_port = (resolved_port is None) and using_default_state
 
     with open(lock_path, "a+", encoding="utf-8") as lock_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
@@ -1821,9 +1998,10 @@ def ensure_server(
             reused = _try_reuse_existing(
                 state_file,
                 requested_host=target_host,
-                requested_port=port,
+                requested_port=resolved_port,
                 timeout=_HEALTH_PROBE_TIMEOUT_S,
                 config=cfg,
+                fallback_default_port=fallback_default_port,
             )
             if reused is not None:
                 return reused
@@ -1846,7 +2024,7 @@ def ensure_server(
                     proc = _spawn_detached_server(
                         resolved_state,
                         host=target_host,
-                        port=port,
+                        port=resolved_port,
                         idle_seconds=resolved_idle,
                         explicit_state_dir=state_dir,
                         ui_dir=ui_dir,
@@ -1864,9 +2042,10 @@ def ensure_server(
                     race_reused = _try_reuse_existing(
                         state_file,
                         requested_host=target_host,
-                        requested_port=port,
+                        requested_port=resolved_port,
                         timeout=_HEALTH_PROBE_TIMEOUT_S,
                         config=cfg,
+                        fallback_default_port=fallback_default_port,
                     )
                     if race_reused is not None:
                         return race_reused
@@ -1878,7 +2057,9 @@ def ensure_server(
                 if data is not None and isinstance(data.get("port"), int):
                     candidate_port = int(data["port"])
                     data_host = _state_entry_host(data)
-                    if data_host == target_host and (port is None or port <= 0 or candidate_port == port):
+                    if data_host == target_host and (
+                        resolved_port is None or resolved_port <= 0 or candidate_port == resolved_port
+                    ):
                         health = _probe_health(
                             candidate_port,
                             host=target_host,
@@ -1901,13 +2082,45 @@ def ensure_server(
                                 "started": True,
                                 "open_in_preview": resolve_open_in_preview(resp_host, config=cfg),
                             }
+                elif data is None and (
+                    (resolved_port is not None and resolved_port > 0)
+                    or fallback_default_port
+                ):
+                    probe_port = (
+                        resolved_port
+                        if (resolved_port is not None and resolved_port > 0)
+                        else DEFAULT_PORT
+                    )
+                    health = _probe_health(
+                        probe_port,
+                        host=target_host,
+                        timeout=_HEALTH_PROBE_TIMEOUT_S,
+                    )
+                    if health is not None:
+                        resp_host = str(health.get("host") or target_host)
+                        if resp_host == target_host:
+                            try:
+                                starting_file.unlink()
+                            except OSError:
+                                pass
+                            out_port = int(health["port"])
+                            return {
+                                "ok": True,
+                                "host": resp_host,
+                                "port": out_port,
+                                "url": f"http://{resp_host}:{out_port}",
+                                "local_url": f"http://{BIND_HOST}:{out_port}",
+                                "pid": int(health["pid"]),
+                                "started": True,
+                                "open_in_preview": resolve_open_in_preview(resp_host, config=cfg),
+                            }
 
                 if proc is None and watch_pid is not None and not _is_pid_alive(watch_pid):
                     # Previously starting process died before writing server.json; spawn fresh.
                     proc = _spawn_detached_server(
                         resolved_state,
                         host=target_host,
-                        port=port,
+                        port=resolved_port,
                         idle_seconds=resolved_idle,
                         explicit_state_dir=state_dir,
                         ui_dir=ui_dir,
@@ -1939,9 +2152,10 @@ def hook_ensure_server(
     cfg = load_user_config()
     try:
         target_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
+        resolved_port = resolve_port(port, use_env=True)
         resolved_idle = resolve_idle_seconds(idle_seconds, use_env_and_config=True, config=cfg)
     except (ValueError, RuntimeError) as exc:
-        _LOGGER.debug("Hook host/idle resolution failed: %s", exc)
+        _LOGGER.debug("Hook host/port/idle resolution failed: %s", exc)
         return {}
 
     resolved_state = get_state_dir(state_dir)
@@ -1949,6 +2163,8 @@ def hook_ensure_server(
     lock_path = resolved_state / "ensure.lock"
     state_file = resolved_state / "server.json"
     starting_file = resolved_state / "starting.json"
+    using_default_state = state_dir is None and not os.environ.get("SWARM_BOARD_STATE_DIR", "").strip()
+    fallback_default_port = (resolved_port is None) and using_default_state
 
     with open(lock_path, "a+", encoding="utf-8") as lock_fh:
         try:
@@ -1959,9 +2175,10 @@ def hook_ensure_server(
             if _try_reuse_existing(
                 state_file,
                 requested_host=target_host,
-                requested_port=port,
+                requested_port=resolved_port,
                 timeout=_HOOK_PROBE_TIMEOUT_S,
                 config=cfg,
+                fallback_default_port=fallback_default_port,
             ) is not None:
                 return {}
             _stop_mismatched_host_if_verified(state_file, target_host, wait_s=0.2)
@@ -1981,7 +2198,7 @@ def hook_ensure_server(
             proc = _spawn_detached_server(
                 resolved_state,
                 host=target_host,
-                port=port,
+                port=resolved_port,
                 idle_seconds=resolved_idle,
                 explicit_state_dir=state_dir,
                 ui_dir=ui_dir,
@@ -2007,6 +2224,10 @@ def server_status(
     resolved_state = get_state_dir(state_dir)
     state_file = resolved_state / "server.json"
     data = _read_json_file(state_file)
+    try:
+        resolved_port = resolve_port(port, use_env=True)
+    except ValueError:
+        resolved_port = port
 
     explicit_host: str | None = None
     if host is not None:
@@ -2021,16 +2242,31 @@ def server_status(
         entry_host = _state_entry_host(data)
         if (
             (explicit_host is None or entry_host == explicit_host)
-            and (port is None or port <= 0 or entry_port == port)
+            and (resolved_port is None or resolved_port <= 0 or entry_port == resolved_port)
         ):
             candidates.append((entry_host, entry_port))
 
-    if port is not None and port > 0:
+    using_default_state = state_dir is None and not os.environ.get("SWARM_BOARD_STATE_DIR", "").strip()
+    fallback_default_port = (
+        data is None
+        and resolved_port is None
+        and using_default_state
+    )
+
+    if resolved_port is not None and resolved_port > 0:
         try:
             probe_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
         except (ValueError, RuntimeError):
             probe_host = BIND_HOST
-        cand = (probe_host, int(port))
+        cand = (probe_host, int(resolved_port))
+        if cand not in candidates:
+            candidates.append(cand)
+    elif fallback_default_port:
+        try:
+            probe_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
+        except (ValueError, RuntimeError):
+            probe_host = BIND_HOST
+        cand = (probe_host, DEFAULT_PORT)
         if cand not in candidates:
             candidates.append(cand)
 
@@ -2039,6 +2275,8 @@ def server_status(
         if health is not None:
             bound_port = int(health["port"])
             bound_host = str(health.get("host") or cand_host)
+            if explicit_host is not None and bound_host != explicit_host:
+                continue
             return {
                 "ok": True,
                 "running": True,
@@ -2145,70 +2383,83 @@ def run_server(
         )
         return 1
 
-    server = create_server(
-        registry=registry,
-        host=bind_host,
-        port=port,
-        ui_dir=ui_dir,
-        idle_seconds=resolved_idle,
-        allowed_hosts=allowed_hosts,
-    )
-    if force_refresh:
-        try:
-            server.registry.list_flows(force=True)
-        except Exception as exc:  # noqa: BLE001
-            _LOGGER.debug("Initial force refresh failed: %s", exc)
-
-    my_pid = os.getpid()
-    _atomic_write_json(
-        state_file,
-        {
-            "pid": my_pid,
-            "host": server.bind_host,
-            "port": server.bound_port,
-            "url": f"http://{server.bind_host}:{server.bound_port}",
-            "local_url": f"http://{BIND_HOST}:{server.bound_port}",
-            "started_at": datetime.now(tz=timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z"),
-            "repo_root": str(REPO_ROOT),
-        },
-    )
-    try:
-        starting_info = _read_json_file(starting_file)
-        if starting_info is not None and starting_info.get("pid") == my_pid:
-            starting_file.unlink()
-    except OSError:
-        pass
-
+    server: SwarmBoardHTTPServer | None = None
     prev_handlers: dict[int, Any] = {}
-    if threading.current_thread() is threading.main_thread():
-        def _handle_signal(_signum: int, _frame: Any) -> None:
-            threading.Thread(
-                target=server.request_shutdown,
-                name="swarm-board-signal-shutdown",
-                daemon=True,
-            ).start()
-
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                prev_handlers[sig] = signal.getsignal(sig)
-                signal.signal(sig, _handle_signal)
-            except (ValueError, OSError):
-                pass
-
+    my_pid = os.getpid()
+    wrote_state_file = False
     try:
+        server = create_server(
+            registry=registry,
+            host=bind_host,
+            port=port,
+            ui_dir=ui_dir,
+            idle_seconds=resolved_idle,
+            allowed_hosts=allowed_hosts,
+        )
+        if force_refresh:
+            try:
+                server.registry.list_flows(force=True)
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("Initial force refresh failed: %s", exc)
+
+        _atomic_write_json(
+            state_file,
+            {
+                "pid": my_pid,
+                "host": server.bind_host,
+                "port": server.bound_port,
+                "url": f"http://{server.bind_host}:{server.bound_port}",
+                "local_url": f"http://{BIND_HOST}:{server.bound_port}",
+                "started_at": datetime.now(tz=timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
+                "repo_root": str(REPO_ROOT),
+            },
+        )
+        wrote_state_file = True
+        try:
+            starting_info = _read_json_file(starting_file)
+            if starting_info is not None and starting_info.get("pid") == my_pid:
+                starting_file.unlink()
+        except OSError:
+            pass
+
+        if threading.current_thread() is threading.main_thread():
+            def _handle_signal(_signum: int, _frame: Any) -> None:
+                threading.Thread(
+                    target=server.request_shutdown,
+                    name="swarm-board-signal-shutdown",
+                    daemon=True,
+                ).start()
+
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    prev_handlers[sig] = signal.getsignal(sig)
+                    signal.signal(sig, _handle_signal)
+                except (ValueError, OSError):
+                    pass
+
         server.serve_forever(poll_interval=0.2)
     finally:
         try:
-            server.server_close()
+            if server is not None:
+                server.server_close()
         finally:
-            _remove_server_json_if_owner(state_file, my_pid)
+            if wrote_state_file:
+                _remove_server_json_if_owner(state_file, my_pid)
             for sig, prev in prev_handlers.items():
                 try:
                     signal.signal(sig, prev)
                 except (ValueError, OSError):
                     pass
+            try:
+                fcntl.flock(owner_lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                owner_lock.close()
+            except OSError:
+                pass
     return 0
 
 

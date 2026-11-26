@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict, deque
 import json
 import os
 from pathlib import Path
@@ -58,20 +58,81 @@ _BACKTICK_PATH_RE = re.compile(
 _INPUT_BULLET_RE = re.compile(r"^\s*-\s+([A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,8})\s*$")
 _COMMITTEE_FILE_RE = re.compile(r"^(committee-(\d+))\.(?:out\.json|md)$")
 
+HARNESS_STALE_THRESHOLD_S = 1800.0
+_MISSING = object()
+_DIR_RUN_CACHE_MAX = 256
+_AGY_TRANSCRIPT_CACHE_MAX = 256
+_GROK_INDEX_CACHE_MAX = 16
+_GROK_INDEX_TTL_S = 5.0
+_GROK_USAGE_FILE_CACHE_MAX = 256
+_LEDGER_PARSED_CACHE_MAX = 32
+_LEDGER_FLOWS_CACHE_MAX = 32
+
 _DEFAULT_RATE_TABLE = RateTable()
 _DEFAULT_USAGE_INDEX = UsageIndex()
-_DIR_RUN_CACHE: dict[
-    tuple[str, str],
-    tuple[
-        tuple[Any, ...],
-        list[tuple[str, tuple[int, int] | None]],
-        dict[str, Any] | None,
-        frozenset[str],
-    ],
-] = {}
+_DIR_RUN_CACHE: OrderedDict[tuple[str, str], tuple[Any, ...]] = OrderedDict()
+_AGY_TRANSCRIPT_CACHE: OrderedDict[str, tuple[int, int, dict[str, Any]]] = OrderedDict()
+_GROK_INDEX_CACHE: OrderedDict[str, tuple[float, dict[str, Path]]] = OrderedDict()
+_GROK_USAGE_FILE_CACHE: OrderedDict[str, tuple[int, int, dict[str, Any]]] = OrderedDict()
+_LEDGER_PARSED_CACHE: OrderedDict[str, tuple[int, int, int, list[dict[str, Any]]]] = OrderedDict()
+_LEDGER_FLOWS_CACHE: OrderedDict[tuple[Any, ...], tuple[Any, ...]] = OrderedDict()
 
 
-_AGY_TRANSCRIPT_CACHE: dict[str, tuple[int, int, dict[str, Any]]] = {}
+def _lru_get(cache: OrderedDict[Any, Any], key: Any) -> Any:
+    val = cache.get(key, _MISSING)
+    if val is not _MISSING:
+        cache.move_to_end(key)
+    return val
+
+
+def _lru_set(cache: OrderedDict[Any, Any], key: Any, val: Any, max_size: int) -> None:
+    if key in cache:
+        cache.move_to_end(key)
+    cache[key] = val
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def _dir_latest_mtime(run_dir: Path) -> float | None:
+    latest: float | None = None
+    try:
+        with os.scandir(run_dir) as it:
+            for e in it:
+                try:
+                    m = e.stat().st_mtime
+                    if latest is None or m > latest:
+                        latest = m
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    if latest is not None:
+        return latest
+    try:
+        return run_dir.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _refresh_harness_flow(
+    flow: dict[str, Any] | None,
+    live_mtimes: dict[str, float],
+    now_ts: float,
+) -> dict[str, Any] | None:
+    if flow is None or not live_mtimes:
+        return flow
+    agents = flow.get("agents") or ()
+    new_agents = []
+    for a in agents:
+        if isinstance(a, dict) and a.get("state") == "running" and a.get("id") in live_mtimes:
+            a_copy = dict(a)
+            a_copy["durS"] = round(max(0.0, now_ts - live_mtimes[a["id"]]), 2)
+            new_agents.append(a_copy)
+        else:
+            new_agents.append(a)
+    f_copy = dict(flow)
+    f_copy["agents"] = new_agents
+    return f_copy
 
 
 def _resolve_harness_dirs(
@@ -294,23 +355,33 @@ class _GrokUsageLookup:
         if self._loaded:
             return
         self._loaded = True
-        if not self.root.is_dir():
+        root_key = str(self.root)
+        now_mono = time.monotonic()
+        cached = _lru_get(_GROK_INDEX_CACHE, root_key)
+        if cached is not _MISSING and (now_mono - cached[0]) < _GROK_INDEX_TTL_S:
+            self._index = cached[1]
             return
-        try:
-            for proj_dir in self.root.iterdir():
-                if not proj_dir.is_dir():
-                    continue
-                try:
-                    for sess_dir in proj_dir.iterdir():
-                        if not sess_dir.is_dir():
+        index: dict[str, Path] = {}
+        if self.root.is_dir():
+            try:
+                with os.scandir(self.root) as proj_it:
+                    for proj_entry in proj_it:
+                        if not proj_entry.is_dir():
                             continue
-                        usage_file = sess_dir / "usage.json"
-                        if usage_file.is_file():
-                            self._index[sess_dir.name] = usage_file
-                except OSError:
-                    continue
-        except OSError:
-            return
+                        try:
+                            with os.scandir(proj_entry.path) as sess_it:
+                                for sess_entry in sess_it:
+                                    if not sess_entry.is_dir():
+                                        continue
+                                    ufile = Path(sess_entry.path) / "usage.json"
+                                    if ufile.is_file():
+                                        index[sess_entry.name] = ufile
+                        except OSError:
+                            continue
+            except OSError:
+                pass
+        self._index = index
+        _lru_set(_GROK_INDEX_CACHE, root_key, (now_mono, index), _GROK_INDEX_CACHE_MAX)
 
     def get(self, session_id: str | None) -> dict[str, Any] | None:
         if not session_id:
@@ -319,6 +390,15 @@ class _GrokUsageLookup:
         usage_file = self._index.get(session_id.strip())
         if not usage_file:
             return None
+        key = str(usage_file)
+        try:
+            st = os.stat(key)
+        except OSError:
+            return None
+        cached = _lru_get(_GROK_USAGE_FILE_CACHE, key)
+        if cached is not _MISSING and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            return cached[2]
+
         doc = _safe_read_json(usage_file)
         if not isinstance(doc, dict):
             return None
@@ -329,15 +409,15 @@ class _GrokUsageLookup:
         cached_read = int(sess.get("cachedReadTokens") or 0)
         cache_create = int(sess.get("cacheCreationTokens") or 0)
         out_tok = int(sess.get("outputTokens") or 0)
-        in_tok = max(0, total_in - cached_read - cache_create)
+        non_cached_in = max(0, total_in - cached_read - cache_create)
         ticks = sess.get("costUsdTicks")
         cost_usd = (
             round(float(ticks) / 1e10, 4)
             if isinstance(ticks, (int, float)) and ticks > 0
             else None
         )
-        return {
-            "in": in_tok,
+        rec = {
+            "in": non_cached_in,
             "cache": cached_read + cache_create,
             "cacheRead": cached_read,
             "cacheWrite": cache_create,
@@ -345,6 +425,13 @@ class _GrokUsageLookup:
             "model": sess.get("primaryModelId"),
             "costUsd": cost_usd,
         }
+        _lru_set(
+            _GROK_USAGE_FILE_CACHE,
+            key,
+            (st.st_mtime_ns, st.st_size, rec),
+            _GROK_USAGE_FILE_CACHE_MAX,
+        )
+        return rec
 
 
 class _AgyTranscriptLookup:
@@ -368,8 +455,8 @@ class _AgyTranscriptLookup:
             except OSError:
                 continue
             sig = (st.st_mtime_ns, st.st_size)
-            cached = _AGY_TRANSCRIPT_CACHE.get(key)
-            if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
+            cached = _lru_get(_AGY_TRANSCRIPT_CACHE, key)
+            if cached is not _MISSING and cached[0] == sig[0] and cached[1] == sig[1]:
                 rec = cached[2]
                 return (rec if (rec["in"] or rec["cache"] or rec["out"] or rec.get("trace")) else None), tr_path
 
@@ -414,7 +501,12 @@ class _AgyTranscriptLookup:
                 "costUsd": None,
                 "trace": trace,
             }
-            _AGY_TRANSCRIPT_CACHE[key] = (sig[0], sig[1], rec)
+            _lru_set(
+                _AGY_TRANSCRIPT_CACHE,
+                key,
+                (sig[0], sig[1], rec),
+                _AGY_TRANSCRIPT_CACHE_MAX,
+            )
             if in_tok or cache_tok or out_tok or trace:
                 return rec, tr_path
             return None, tr_path
@@ -589,12 +681,19 @@ def _parse_committee_dir(
     cache_key = ("committee", str(run_dir))
     sig = _dir_sig(run_dir, rate_table, usage_index, grok_lookup, agy_lookup) if use_cache else None
     if use_cache and sig is not None:
-        cached = _DIR_RUN_CACHE.get(cache_key)
-        if cached is not None:
-            c_sig, c_ref_sigs, c_flow, c_sids = cached
+        cached = _lru_get(_DIR_RUN_CACHE, cache_key)
+        if cached is not _MISSING:
+            c_sig, c_ref_sigs, c_flow, c_sids, c_live_mtimes, c_has_queued, c_dir_mtime = cached
             if c_sig == sig and all(_stat_sig(p) == s for p, s in c_ref_sigs):
-                seen_session_ids.update(c_sids)
-                return c_flow
+                stale_aged = any(
+                    (now_ts - md_m) > HARNESS_STALE_THRESHOLD_S
+                    for md_m in c_live_mtimes.values()
+                )
+                if not stale_aged and c_has_queued and c_dir_mtime is not None:
+                    stale_aged = (now_ts - c_dir_mtime) > HARNESS_STALE_THRESHOLD_S
+                if not stale_aged:
+                    seen_session_ids.update(c_sids)
+                    return _refresh_harness_flow(c_flow, c_live_mtimes, now_ts)
 
     resolved_path = run_dir / "committee.resolved.json"
     resolved_doc = _safe_read_json(resolved_path)
@@ -633,6 +732,9 @@ def _parse_committee_dir(
     run_session_ids: list[str] = []
     matched_tr_paths: list[str] = []
     running_count = 0
+    live_md_mtimes: dict[str, float] = {}
+    has_queued = False
+    dir_latest_mtime = _dir_latest_mtime(run_dir)
 
     if resolved_path.is_file():
         res_mtime, res_size = _safe_stat_mtime_size(resolved_path)
@@ -670,11 +772,19 @@ def _parse_committee_dir(
 
         # Live detection: brief exists and output is missing or empty.
         if md_path.is_file() and (not out_path.is_file() or not out_size):
-            state = "running"
-            running_count += 1
-            started_ts = md_mtime
-            ended_ts = None
-            dur_s = round(max(0.0, now_ts - md_mtime), 2) if md_mtime is not None else None
+            if md_mtime is not None and (now_ts - md_mtime) > HARNESS_STALE_THRESHOLD_S:
+                state = "stale"
+                started_ts = md_mtime
+                ended_ts = None
+                dur_s = None
+            else:
+                state = "running"
+                running_count += 1
+                started_ts = md_mtime
+                ended_ts = None
+                dur_s = round(max(0.0, now_ts - md_mtime), 2) if md_mtime is not None else None
+                if md_mtime is not None:
+                    live_md_mtimes[member_id] = md_mtime
         elif out_data is not None:
             raw_status = str(out_data.get("status") or "").lower()
             state = "done" if raw_status == "success" else "error"
@@ -688,7 +798,11 @@ def _parse_committee_dir(
             else:
                 started_ts = ended_ts
         else:
-            state = "queued"
+            if dir_latest_mtime is not None and (now_ts - dir_latest_mtime) > HARNESS_STALE_THRESHOLD_S:
+                state = "stale"
+            else:
+                state = "queued"
+                has_queued = True
             started_ts = md_mtime
             ended_ts = None
             dur_s = None
@@ -883,7 +997,7 @@ def _parse_committee_dir(
         agents=agents,
         outputs=outputs,
     )
-    if use_cache and sig is not None and running_count == 0:
+    if use_cache and sig is not None:
         ref_sigs = [
             (str(o["path"]), _stat_sig(o["path"]))
             for o in outputs
@@ -891,7 +1005,12 @@ def _parse_committee_dir(
         ]
         for trp in matched_tr_paths:
             ref_sigs.append((trp, _stat_sig(trp)))
-        _DIR_RUN_CACHE[cache_key] = (sig, ref_sigs, flow, frozenset(run_session_ids))
+        _lru_set(
+            _DIR_RUN_CACHE,
+            cache_key,
+            (sig, ref_sigs, flow, frozenset(run_session_ids), live_md_mtimes, has_queued, dir_latest_mtime),
+            _DIR_RUN_CACHE_MAX,
+        )
     return flow
 
 
@@ -909,12 +1028,19 @@ def _parse_orchestrate_dir(
     cache_key = ("orchestrate", str(run_dir))
     sig = _dir_sig(run_dir, rate_table, usage_index, grok_lookup, agy_lookup) if use_cache else None
     if use_cache and sig is not None:
-        cached = _DIR_RUN_CACHE.get(cache_key)
-        if cached is not None:
-            c_sig, c_ref_sigs, c_flow, c_sids = cached
+        cached = _lru_get(_DIR_RUN_CACHE, cache_key)
+        if cached is not _MISSING:
+            c_sig, c_ref_sigs, c_flow, c_sids, c_live_mtimes, c_has_queued, c_dir_mtime = cached
             if c_sig == sig and all(_stat_sig(p) == s for p, s in c_ref_sigs):
-                seen_session_ids.update(c_sids)
-                return c_flow
+                stale_aged = any(
+                    (now_ts - md_m) > HARNESS_STALE_THRESHOLD_S
+                    for md_m in c_live_mtimes.values()
+                )
+                if not stale_aged and c_has_queued and c_dir_mtime is not None:
+                    stale_aged = (now_ts - c_dir_mtime) > HARNESS_STALE_THRESHOLD_S
+                if not stale_aged:
+                    seen_session_ids.update(c_sids)
+                    return _refresh_harness_flow(c_flow, c_live_mtimes, now_ts)
 
     plan_path = run_dir / "plan.resolved.json"
     plan_doc = _safe_read_json(plan_path)
@@ -945,6 +1071,9 @@ def _parse_orchestrate_dir(
     run_session_ids: list[str] = []
     matched_tr_paths: list[str] = []
     running_count = 0
+    live_md_mtimes: dict[str, float] = {}
+    has_queued = False
+    dir_latest_mtime = _dir_latest_mtime(run_dir)
     has_deps = False
 
     plan_mtime, plan_size = _safe_stat_mtime_size(plan_path)
@@ -1035,11 +1164,19 @@ def _parse_orchestrate_dir(
             timestamps.append(out_mtime)
 
         if md_path.is_file() and (not out_path.is_file() or not out_size):
-            state = "running"
-            running_count += 1
-            started_ts = md_mtime
-            ended_ts = None
-            dur_s = round(max(0.0, now_ts - md_mtime), 2) if md_mtime is not None else None
+            if md_mtime is not None and (now_ts - md_mtime) > HARNESS_STALE_THRESHOLD_S:
+                state = "stale"
+                started_ts = md_mtime
+                ended_ts = None
+                dur_s = None
+            else:
+                state = "running"
+                running_count += 1
+                started_ts = md_mtime
+                ended_ts = None
+                dur_s = round(max(0.0, now_ts - md_mtime), 2) if md_mtime is not None else None
+                if md_mtime is not None:
+                    live_md_mtimes[tid] = md_mtime
         elif out_data is not None:
             raw_status = str(out_data.get("status") or "").lower()
             state = "done" if raw_status == "success" else "error"
@@ -1052,7 +1189,11 @@ def _parse_orchestrate_dir(
                 else (ended_ts - dur_s if ended_ts is not None and dur_s is not None else ended_ts)
             )
         else:
-            state = "queued"
+            if dir_latest_mtime is not None and (now_ts - dir_latest_mtime) > HARNESS_STALE_THRESHOLD_S:
+                state = "stale"
+            else:
+                state = "queued"
+                has_queued = True
             started_ts = md_mtime
             ended_ts = None
             dur_s = None
@@ -1209,7 +1350,7 @@ def _parse_orchestrate_dir(
         agents=agents,
         outputs=outputs,
     )
-    if use_cache and sig is not None and running_count == 0:
+    if use_cache and sig is not None:
         ref_sigs = [
             (str(o["path"]), _stat_sig(o["path"]))
             for o in outputs
@@ -1217,7 +1358,12 @@ def _parse_orchestrate_dir(
         ]
         for trp in matched_tr_paths:
             ref_sigs.append((trp, _stat_sig(trp)))
-        _DIR_RUN_CACHE[cache_key] = (sig, ref_sigs, flow, frozenset(run_session_ids))
+        _lru_set(
+            _DIR_RUN_CACHE,
+            cache_key,
+            (sig, ref_sigs, flow, frozenset(run_session_ids), live_md_mtimes, has_queued, dir_latest_mtime),
+            _DIR_RUN_CACHE_MAX,
+        )
     return flow
 
 
@@ -1231,36 +1377,75 @@ def _parse_sessions_ledger(
     rate_table: RateTable | None,
     window_s: float = 300.0,
     max_recent_lines: int = 200,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     """Group orphaned recent agent-delegate ledger runs within 5-min windows (>= 2 runs)."""
-    if not ledger_path.is_file():
-        return []
-    try:
-        lines = ledger_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
+    ledger_sig = _stat_sig(ledger_path)
+    if ledger_sig is None:
         return []
 
-    entries: list[dict[str, Any]] = []
-    for raw in lines[-max_recent_lines:]:
-        raw = raw.strip()
-        if not raw:
-            continue
+    ledger_key = (str(ledger_path), float(window_s), int(max_recent_lines))
+    flow_sig = (
+        ledger_sig,
+        frozenset(seen_session_ids),
+        rate_table.cache_signature() if rate_table else None,
+        str(usage_index.path) if usage_index else "",
+        _stat_sig(usage_index.path) if usage_index else None,
+        str(grok_lookup.root) if grok_lookup else "",
+        tuple(str(p) for p in agy_lookup.roots) if agy_lookup else (),
+    )
+    if use_cache:
+        cached_flows = _lru_get(_LEDGER_FLOWS_CACHE, ledger_key)
+        if cached_flows is not _MISSING:
+            c_sig, c_tr_sigs, c_flows = cached_flows
+            if c_sig == flow_sig and all(_stat_sig(p) == s for p, s in c_tr_sigs):
+                return c_flows
+
+    parsed_key = str(ledger_path)
+    cached_parsed = _lru_get(_LEDGER_PARSED_CACHE, parsed_key) if use_cache else _MISSING
+    raw_entries: list[dict[str, Any]] | None = None
+    if cached_parsed is not _MISSING and cached_parsed[:3] == (ledger_sig[0], ledger_sig[1], max_recent_lines):
+        raw_entries = cached_parsed[3]
+
+    if raw_entries is None:
+        raw_entries = []
         try:
-            obj = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        sid = str(obj.get("session_id") or "").strip()
-        if not sid or sid in seen_session_ids:
-            continue
-        ts = parse_iso_ts(obj.get("ts"))
-        if ts is None:
-            continue
-        obj["_parsed_ts"] = ts
-        entries.append(obj)
+            with ledger_path.open("r", encoding="utf-8", errors="replace") as fh:
+                tail_lines = deque(fh, maxlen=max_recent_lines)
+        except OSError:
+            return []
+        for raw in tail_lines:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            sid = str(obj.get("session_id") or "").strip()
+            if not sid:
+                continue
+            ts = parse_iso_ts(obj.get("ts"))
+            if ts is None:
+                continue
+            obj_copy = dict(obj)
+            obj_copy["_sid"] = sid
+            obj_copy["_parsed_ts"] = ts
+            raw_entries.append(obj_copy)
+        if use_cache:
+            _lru_set(
+                _LEDGER_PARSED_CACHE,
+                parsed_key,
+                (ledger_sig[0], ledger_sig[1], max_recent_lines, raw_entries),
+                _LEDGER_PARSED_CACHE_MAX,
+            )
 
+    entries = [e for e in raw_entries if e["_sid"] not in seen_session_ids]
     if len(entries) < 2:
+        if use_cache:
+            _lru_set(_LEDGER_FLOWS_CACHE, ledger_key, (flow_sig, [], []), _LEDGER_FLOWS_CACHE_MAX)
         return []
 
     entries.sort(key=lambda e: e["_parsed_ts"])
@@ -1278,22 +1463,23 @@ def _parse_sessions_ledger(
         clusters.append(current)
 
     flows: list[dict[str, Any]] = []
+    matched_tr_paths: list[str] = []
     for cluster in clusters:
         first_ts = cluster[0]["_parsed_ts"]
         last_ts = cluster[-1]["_parsed_ts"]
-        first_sid = str(cluster[0]["session_id"])
+        first_sid = str(cluster[0]["_sid"])
         flow_id = f"delegate:{int(first_ts)}-{first_sid[:8]}"
 
         agents: list[dict[str, Any]] = []
         for idx, rec in enumerate(cluster, start=1):
-            sid = str(rec["session_id"]).strip()
+            sid = rec["_sid"]
             cli = rec.get("cli")
             model = rec.get("model")
             role = rec.get("role") or "worker"
             ts = rec["_parsed_ts"]
 
             agent_lab = normalize_lab(model, cli)
-            tokens, cost_usd, cost_estimated, _tr_path, cache_read, trace = _resolve_usage_and_cost(
+            tokens, cost_usd, cost_estimated, tr_path, cache_read, trace = _resolve_usage_and_cost(
                 sid,
                 model,
                 cli=cli,
@@ -1304,6 +1490,8 @@ def _parse_sessions_ledger(
                 agy_lookup=agy_lookup,
                 rate_table=rate_table,
             )
+            if tr_path is not None:
+                matched_tr_paths.append(str(tr_path))
             links: list[dict[str, Any]] = []
             sess_link = make_session_link(cli, sid)
             if sess_link is not None:
@@ -1359,6 +1547,10 @@ def _parse_sessions_ledger(
                 agents=agents,
             )
         )
+
+    if use_cache:
+        tr_sigs = [(trp, _stat_sig(trp)) for trp in set(matched_tr_paths)]
+        _lru_set(_LEDGER_FLOWS_CACHE, ledger_key, (flow_sig, tr_sigs, flows), _LEDGER_FLOWS_CACHE_MAX)
 
     return flows
 
@@ -1461,6 +1653,7 @@ def discover_harness_runs(
             grok_lookup=grok_lookup,
             agy_lookup=agy_lookup,
             rate_table=rates,
+            use_cache=use_cache,
         )
     )
 

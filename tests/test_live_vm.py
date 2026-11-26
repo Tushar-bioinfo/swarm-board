@@ -9,8 +9,36 @@ import time
 import unittest
 
 from swarm_board.adapters import BoardRegistry
+from swarm_board.adapters.harness_runs import HARNESS_STALE_THRESHOLD_S
 from swarm_board.adapters.t3_delegations import discover_t3_flows
 from swarm_board.safety import redact_if_secret_name
+from swarm_board.schema import VALID_STATES
+
+EXPECTED_ACTIVE_THREAD_KEYS = frozenset(
+    {
+        "id",
+        "flowId",
+        "rootThreadId",
+        "parentThreadId",
+        "title",
+        "project",
+        "projectRoot",
+        "harness",
+        "state",
+        "isLive",
+        "settled",
+        "model",
+        "lab",
+        "startedAt",
+        "updatedAt",
+        "durS",
+        "activeChildren",
+        "totalChildren",
+        "last",
+        "href",
+        "links",
+    }
+)
 
 
 T3_DB = Path.home() / ".t3" / "userdata" / "statev2.sqlite"
@@ -132,6 +160,80 @@ class LiveVmTests(unittest.TestCase):
                     cmd = (lk.get("cmd") or "").lower()
                     for forbidden in ("agy ", "grok ", "cursor ", "muse "):
                         self.assertFalse(cmd.startswith(forbidden), f"Invented CLI resume cmd: {cmd}")
+
+    def test_live_active_threads_zero_zombie_committees_and_flat_rss(self) -> None:
+        active = self.reg.list_active_threads(force=True)
+        self.assertIsInstance(active, list)
+        flow_ids = {f["id"] for f in self.reg.list_flows(force=False)}
+
+        seen_non_live = False
+        for item in active:
+            self.assertEqual(set(item.keys()), EXPECTED_ACTIVE_THREAD_KEYS)
+            self.assertIn(item["state"], VALID_STATES)
+            self.assertIsInstance(item["isLive"], bool)
+            if item["isLive"]:
+                self.assertFalse(seen_non_live, "Live active threads must precede non-live entries")
+                if item.get("flowId"):
+                    self.assertIn(item["flowId"], flow_ids)
+            else:
+                seen_non_live = True
+
+        self.assertEqual(
+            self.reg.get_active_count(),
+            sum(1 for t in active if t.get("isLive")),
+        )
+
+        # Verify zero zombie running committee seats past HARNESS_STALE_THRESHOLD_S
+        now_s = time.time()
+        for flow in self.flows:
+            if flow["harness"] != "committee":
+                continue
+            outputs_by_id = {o["id"]: o for o in flow.get("outputs") or ()}
+            for agent in flow.get("agents") or ():
+                if agent.get("state") == "running":
+                    brief = next(
+                        (outputs_by_id[oid] for oid in (agent.get("outputIds") or ()) if oid.endswith("-brief") and oid in outputs_by_id),
+                        None,
+                    )
+                    if brief and brief.get("path") and Path(brief["path"]).is_file():
+                        age_s = now_s - Path(brief["path"]).stat().st_mtime
+                        self.assertLessEqual(
+                            age_s,
+                            HARNESS_STALE_THRESHOLD_S + 30.0,
+                            f"Zombie running committee seat {flow['id']}/{agent['id']} age={age_s:.0f}s",
+                        )
+
+        # Verify repeated snapshot_digest() keeps steady-state VmRSS flat
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "\n".join(
+                    [
+                        "import re",
+                        "from swarm_board.adapters import BoardRegistry",
+                        "def rss():",
+                        "    return int(re.search(r'^VmRSS:\\s+(\\d+)\\s+kB', open('/proc/self/status').read(), re.M).group(1)) / 1024.0",
+                        "r = BoardRegistry(cache_ttl_s=0.0)",
+                        "[r.snapshot_digest() for _ in range(5)]",
+                        "r0 = rss()",
+                        "[r.snapshot_digest() for _ in range(25)]",
+                        "r1 = rss()",
+                        "r.close()",
+                        "print(f'{r0:.2f} {r1:.2f} {r1 - r0:.2f}')",
+                    ]
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        r0_s, r1_s, delta_s = proc.stdout.strip().splitlines()[-1].split()
+        self.assertLessEqual(
+            float(delta_s),
+            5.0,
+            f"Steady-state VmRSS grew too much: {r0_s} -> {r1_s} MB (delta {delta_s} MB)",
+        )
 
 
 if __name__ == "__main__":

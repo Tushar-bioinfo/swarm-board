@@ -14,7 +14,7 @@ import time
 from typing import Any
 
 from ..safety import is_path_allowed, redact_if_secret_name, safe_read_citation_lines, safe_read_text
-from ..schema import RateTable, UsageIndex, default_t3_userdata_dir, parse_iso_ts
+from ..schema import RateTable, UsageIndex, compute_dur_s, default_t3_userdata_dir, parse_iso_ts
 from .harness_runs import (
     DEFAULT_COMMITTEE_DIR,
     DEFAULT_ORCHESTRATE_DIR,
@@ -67,6 +67,7 @@ _TEST_ISOLATION_KEYS = (
     "committee_dir",
     "orchestrate_dir",
 )
+_LIVE_AGENT_STATES = frozenset({"running", "waiting", "queued"})
 
 
 def _as_path_list(val: Any) -> list[Path] | None:
@@ -96,10 +97,273 @@ def _flow_has_running(flow: dict[str, Any]) -> bool:
     return False
 
 
+def _flow_live_rank(flow: dict[str, Any]) -> int:
+    has_waiting_or_queued = False
+    for agent in flow.get("agents") or ():
+        if not isinstance(agent, dict):
+            continue
+        st = agent.get("state")
+        if st == "running":
+            return 0
+        if st in ("waiting", "queued"):
+            has_waiting_or_queued = True
+    return 1 if has_waiting_or_queued else 2
+
+
 def _flow_sort_key(flow: dict[str, Any]) -> tuple[int, float, str]:
-    running_rank = 0 if _flow_has_running(flow) else 1
+    live_rank = _flow_live_rank(flow)
     updated_ts = parse_iso_ts(flow.get("updatedAt") or flow.get("startedAt")) or 0.0
-    return (running_rank, -updated_ts, str(flow.get("id") or ""))
+    return (live_rank, -updated_ts, str(flow.get("id") or ""))
+
+
+def _active_thread_sort_key(item: dict[str, Any]) -> tuple[int, int, float, str]:
+    is_live = bool(item.get("isLive"))
+    state = str(item.get("state") or "")
+    updated_ts = parse_iso_ts(item.get("updatedAt") or item.get("startedAt")) or 0.0
+    return (
+        0 if is_live else 1,
+        0 if state == "running" else 1,
+        -updated_ts,
+        str(item.get("id") or ""),
+    )
+
+
+def _live_flow_to_active_thread(
+    flow: dict[str, Any],
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any] | None:
+    """Project a live non-T3 flow into the active-thread summary schema, or None if idle."""
+    fid = str(flow.get("id") or "").strip()
+    if not fid:
+        return None
+    agents = [a for a in (flow.get("agents") or ()) if isinstance(a, dict)]
+    live_agents = [a for a in agents if a.get("state") in _LIVE_AGENT_STATES]
+    if not live_agents:
+        return None
+
+    if any(a.get("state") == "running" for a in live_agents):
+        state = "running"
+    elif any(a.get("state") == "waiting" for a in live_agents):
+        state = "waiting"
+    else:
+        state = "queued"
+
+    rep_agent: dict[str, Any] | None = None
+    for target_state in ("running", "waiting", "queued"):
+        rep_agent = next(
+            (a for a in live_agents if a.get("state") == target_state and a.get("model")),
+            None,
+        )
+        if rep_agent is not None:
+            break
+    if rep_agent is None:
+        rep_agent = next(
+            (a for a in agents if a.get("role") in ("root", "coordinator") and a.get("model")),
+            None,
+        )
+    if rep_agent is None:
+        rep_agent = live_agents[0]
+
+    model = rep_agent.get("model") or next((a.get("model") for a in agents if a.get("model")), None)
+    lab = rep_agent.get("lab") or next((a.get("lab") for a in agents if a.get("lab")), None) or "other"
+
+    started_at = flow.get("startedAt")
+    updated_at = flow.get("updatedAt") or started_at
+    dur_s = (
+        compute_dur_s(started_at, None, is_running=True, now_ts=now_ts)
+        if started_at
+        else next(
+            (
+                a.get("durS")
+                for a in (rep_agent, *live_agents)
+                if isinstance(a.get("durS"), (int, float))
+            ),
+            None,
+        )
+    )
+
+    has_head = any(a.get("role") in ("root", "coordinator") for a in agents)
+    if has_head:
+        children = [a for a in agents if a.get("role") not in ("root", "coordinator")]
+    elif len(agents) > 1:
+        children = agents
+    else:
+        children = []
+    total_children = len(children)
+    active_children = sum(1 for a in children if a.get("state") in _LIVE_AGENT_STATES)
+
+    last_act: str | None = None
+    for candidate_list in (
+        [a for a in live_agents if a.get("state") == "running"],
+        [a for a in live_agents if a.get("state") == "waiting"],
+        live_agents,
+        agents,
+    ):
+        for ag in candidate_list:
+            val = ag.get("last")
+            if isinstance(val, str) and val.strip():
+                last_act = val.strip()
+                break
+        if last_act is not None:
+            break
+    if last_act is None:
+        posts = flow.get("posts")
+        if isinstance(posts, list) and posts:
+            last_post = posts[-1]
+            if isinstance(last_post, dict):
+                txt = last_post.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    last_act = txt.strip()[:160]
+
+    links = [dict(lk) if isinstance(lk, dict) else lk for lk in (flow.get("links") or ())]
+    href = next((lk.get("href") for lk in links if isinstance(lk, dict) and lk.get("href")), None)
+    if href is None:
+        for ag in agents:
+            for lk in ag.get("links") or ():
+                if isinstance(lk, dict) and lk.get("href"):
+                    href = lk.get("href")
+                    break
+            if href is not None:
+                break
+
+    return {
+        "id": fid,
+        "flowId": fid,
+        "rootThreadId": None,
+        "parentThreadId": None,
+        "title": flow.get("title") or fid,
+        "project": flow.get("project") or "",
+        "projectRoot": flow.get("projectRoot"),
+        "harness": flow.get("harness") or "",
+        "state": state,
+        "isLive": True,
+        "settled": False,
+        "model": model,
+        "lab": lab,
+        "startedAt": started_at,
+        "updatedAt": updated_at,
+        "durS": dur_s,
+        "activeChildren": active_children,
+        "totalChildren": total_children,
+        "last": last_act,
+        "href": href,
+        "links": links,
+    }
+
+
+def _flow_enrich_sig(flow: dict[str, Any], label_sig: tuple[Any, ...]) -> bytes:
+    """Compute a compact content signature for a raw flow + labeler state."""
+    h = hashlib.blake2b(digest_size=16)
+
+    def _feed(val: Any) -> None:
+        if val is None:
+            h.update(b"\x00")
+        elif isinstance(val, bool):
+            h.update(b"\x01" if val else b"\x02")
+        elif isinstance(val, (int, float)):
+            h.update(f"n:{val}".encode("utf-8"))
+        elif isinstance(val, str):
+            h.update(val.encode("utf-8", errors="replace"))
+        else:
+            h.update(repr(val).encode("utf-8", errors="replace"))
+        h.update(b"\x1f")
+
+    for part in label_sig:
+        _feed(part)
+    for k in (
+        "id",
+        "title",
+        "goal",
+        "project",
+        "projectRoot",
+        "harness",
+        "kind",
+        "startedAt",
+        "updatedAt",
+        "decision",
+    ):
+        _feed(flow.get(k))
+
+    posts = flow.get("posts") or ()
+    _feed(len(posts))
+    if isinstance(posts, list) and posts:
+        lp = posts[-1]
+        if isinstance(lp, dict):
+            _feed(lp.get("id"))
+            _feed(lp.get("at"))
+            _feed(str(lp.get("text") or "")[:120])
+
+    links = flow.get("links") or ()
+    _feed(len(links))
+    for lk in links:
+        if isinstance(lk, dict):
+            _feed(lk.get("kind"))
+            _feed(lk.get("id"))
+            _feed(lk.get("href"))
+
+    outputs = flow.get("outputs") or ()
+    _feed(len(outputs))
+    for out in outputs:
+        if isinstance(out, dict):
+            _feed(out.get("id"))
+            _feed(out.get("kind"))
+            _feed(out.get("title"))
+            _feed(out.get("by"))
+            _feed(out.get("path"))
+            _feed(out.get("size"))
+            _feed(out.get("at"))
+            body = out.get("body")
+            if isinstance(body, str):
+                _feed(len(body))
+                _feed(hashlib.blake2b(body[:2048].encode("utf-8", errors="replace"), digest_size=8).digest())
+            else:
+                _feed(None)
+
+    agents = flow.get("agents") or ()
+    _feed(len(agents))
+    for ag in agents:
+        if not isinstance(ag, dict):
+            _feed(ag)
+            continue
+        for k in (
+            "id",
+            "parent",
+            "name",
+            "role",
+            "workstream",
+            "lab",
+            "model",
+            "state",
+            "startedAt",
+            "endedAt",
+            "durS",
+            "costUsd",
+            "costEstimated",
+            "last",
+            "verdict",
+            "label",
+            "task",
+            "brief",
+            "usageDeduped",
+        ):
+            _feed(ag.get(k))
+        tok = ag.get("tokens")
+        _feed(tuple(sorted(tok.items())) if isinstance(tok, dict) else tok)
+        res = ag.get("result")
+        _feed(hashlib.blake2b(res.encode("utf-8", errors="replace"), digest_size=8).digest() if isinstance(res, str) else res)
+        _feed(len(ag.get("trace") or ()))
+        _feed(ag.get("outputIds"))
+        hint = ag.get("_labelHint")
+        if isinstance(hint, dict):
+            _feed(hint.get("rawTitle"))
+            _feed(hint.get("slug"))
+            _feed(hint.get("planTask"))
+            _feed(hint.get("prompt"))
+        else:
+            _feed(None)
+
+    return h.digest()
 
 
 def _lab_of(agent: dict[str, Any]) -> str:
@@ -341,6 +605,9 @@ class BoardRegistry:
                 config=self._label_config,
                 cache=self._label_cache,
             )
+            if label_override.get("enabled") is False:
+                self._bg_labeler.enabled = False
+                self._bg_labeler.config["enabled"] = False
         else:
             self._label_config = None
             self._label_cache = None
@@ -351,6 +618,8 @@ class BoardRegistry:
         self._has_snapshot: bool = False
         self._cached_flows: list[dict[str, Any]] = []
         self._flow_by_id: dict[str, dict[str, Any]] = {}
+        self._cached_active_threads: list[dict[str, Any]] = []
+        self._enriched_flow_cache: dict[str, tuple[bytes, dict[str, Any]]] = {}
         self._cached_label_sig: tuple[int, float] = self._label_state_sig()
         self.last_errors: dict[str, str] = {}
 
@@ -472,37 +741,119 @@ class BoardRegistry:
 
         sorted_flows = sorted(by_id.values(), key=_flow_sort_key)
         enriched_flows: list[dict[str, Any]] = []
-        for flow in sorted_flows:
-            f_copy = dict(flow)
-            raw_agents = flow.get("agents")
-            if isinstance(raw_agents, list):
-                f_copy["agents"] = [
-                    dict(a) if isinstance(a, dict) else a for a in raw_agents
-                ]
-            raw_outputs = flow.get("outputs")
-            if isinstance(raw_outputs, list):
-                f_copy["outputs"] = [
-                    dict(o) if isinstance(o, dict) else o for o in raw_outputs
-                ]
+        if enrich_labels:
+            label_sig = (
+                *self._label_state_sig(),
+                bool(self._bg_labeler.enabled) if self._bg_labeler is not None else False,
+                id(self._bg_labeler),
+                id(self._label_cache),
+            )
+            lbl_cfg = None if self._bg_labeler is not None else self._label_config
+            active_fids: set[str] = set()
+            for flow in sorted_flows:
+                fid = str(flow.get("id") or "")
+                active_fids.add(fid)
+                fsig = _flow_enrich_sig(flow, label_sig)
+                cached = self._enriched_flow_cache.get(fid)
+                if cached is not None and cached[0] == fsig:
+                    enriched_flows.append(cached[1])
+                    continue
 
-            if enrich_labels and enrich_flow_labels is not None:
-                try:
-                    f_copy = enrich_flow_labels(
-                        f_copy,
-                        cache=self._label_cache,
-                        background=self._bg_labeler,
-                        config=self._label_config,
-                    )
-                except Exception as exc:  # noqa: BLE001 - isolate labeler failures
-                    errors.setdefault("labeler", f"{type(exc).__name__}: {exc}")
+                f_copy = dict(flow)
+                raw_agents = flow.get("agents")
+                if isinstance(raw_agents, list):
+                    f_copy["agents"] = [
+                        dict(a) if isinstance(a, dict) else a for a in raw_agents
+                    ]
+                raw_outputs = flow.get("outputs")
+                if isinstance(raw_outputs, list):
+                    f_copy["outputs"] = list(raw_outputs)
 
-            if enrich_labels:
+                if enrich_flow_labels is not None:
+                    try:
+                        f_copy = enrich_flow_labels(
+                            f_copy,
+                            cache=self._label_cache,
+                            background=self._bg_labeler,
+                            config=lbl_cfg,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - isolate labeler failures
+                        errors.setdefault("labeler", f"{type(exc).__name__}: {exc}")
+
                 for agent in f_copy.get("agents") or ():
                     if isinstance(agent, dict):
                         agent.pop("_labelHint", None)
-            enriched_flows.append(f_copy)
+                self._enriched_flow_cache[fid] = (fsig, f_copy)
+                enriched_flows.append(f_copy)
+
+            if len(self._enriched_flow_cache) > len(active_fids):
+                for stale_id in [k for k in self._enriched_flow_cache if k not in active_fids]:
+                    self._enriched_flow_cache.pop(stale_id, None)
+        else:
+            for flow in sorted_flows:
+                f_copy = dict(flow)
+                raw_agents = flow.get("agents")
+                if isinstance(raw_agents, list):
+                    f_copy["agents"] = [
+                        dict(a) if isinstance(a, dict) else a for a in raw_agents
+                    ]
+                raw_outputs = flow.get("outputs")
+                if isinstance(raw_outputs, list):
+                    f_copy["outputs"] = [
+                        dict(o) if isinstance(o, dict) else o for o in raw_outputs
+                    ]
+                enriched_flows.append(f_copy)
 
         return enriched_flows, errors
+
+    def _collect_active_threads_unlocked(
+        self,
+        flows: list[dict[str, Any]],
+        errors: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        cfg = self.config
+        now_ts = cfg.get("now_ts")
+        brain_roots = _as_path_list(cfg.get("brain_roots"))
+        collected: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        try:
+            mod = self._import_optional_adapter("t3_delegations")
+            if mod is not None and hasattr(mod, "discover_active_threads"):
+                items = mod.discover_active_threads(
+                    db_path=cfg.get("statev2_db"),
+                    env_id=cfg.get("env_id"),
+                    rate_table=self.rate_table,
+                    usage_index=self.usage_index,
+                    brain_roots=brain_roots,
+                    grok_sessions_root=cfg.get("grok_sessions_root"),
+                    now_ts=now_ts,
+                )
+                if isinstance(items, list):
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        tid = str(item.get("id") or "").strip()
+                        if not tid or tid in seen_ids:
+                            continue
+                        seen_ids.add(tid)
+                        collected.append(item)
+        except Exception as exc:  # noqa: BLE001 - isolate failing adapter
+            errors["t3_active_threads"] = f"{type(exc).__name__}: {exc}"
+
+        for flow in flows:
+            if not isinstance(flow, dict) or str(flow.get("harness") or "") == "t3":
+                continue
+            item = _live_flow_to_active_thread(flow, now_ts=now_ts)
+            if item is None:
+                continue
+            tid = str(item.get("id") or "")
+            if tid and tid not in seen_ids:
+                seen_ids.add(tid)
+                collected.append(item)
+
+        collected.sort(key=_active_thread_sort_key)
+        return collected
 
     def list_raw_flows(self) -> list[dict[str, Any]]:
         """Return shallow-copied discovered flows with `_labelHint` intact (for CLI batch labeling)."""
@@ -521,8 +872,10 @@ class BoardRegistry:
         ):
             return
         flows, errors = self._collect_all_flows_unlocked()
+        active_threads = self._collect_active_threads_unlocked(flows, errors)
         self._cached_flows = flows
         self._flow_by_id = {str(f["id"]): f for f in flows if isinstance(f, dict) and f.get("id")}
+        self._cached_active_threads = active_threads
         self.last_errors = errors
         self._cached_at = time.monotonic()
         self._cached_label_sig = self._label_state_sig()
@@ -599,6 +952,23 @@ class BoardRegistry:
         with self._lock:
             self._ensure_fresh_unlocked(force=force)
             return [self._compact_flow(f) for f in self._cached_flows]
+
+    def list_active_threads(self, force: bool = False) -> list[dict[str, Any]]:
+        """Return active standalone T3 threads and live non-T3 flows."""
+        with self._lock:
+            self._ensure_fresh_unlocked(force=force)
+            return [dict(t) for t in self._cached_active_threads]
+
+    def get_active_count(self) -> int:
+        """Return count of currently live active threads without triggering a cold scan."""
+        with self._lock:
+            if not self._has_snapshot:
+                return 0
+            return sum(
+                1
+                for t in self._cached_active_threads
+                if isinstance(t, dict) and t.get("isLive")
+            )
 
     def get_flow(self, flow_id: str) -> dict[str, Any] | None:
         """Return a single full flow enriched with telemetry breakdown and timeline buckets."""
@@ -1115,11 +1485,12 @@ class BoardRegistry:
                 if mod is not None and hasattr(mod, "load_subagent_detail"):
                     detail = mod.load_subagent_detail(self.config.get("statev2_db"), str(subagent_id))
                     if detail:
-                        body = (
-                            detail
-                            if isinstance(detail, str)
-                            else json.dumps(detail, indent=2, ensure_ascii=False)
-                        )
+                        if kind == "result" and isinstance(detail, dict) and isinstance(detail.get("result"), str):
+                            body = detail["result"]
+                        elif isinstance(detail, str):
+                            body = detail
+                        else:
+                            body = json.dumps(detail, indent=2, ensure_ascii=False)
                         return {**target, "ok": True, "detail": detail, "body": body}
                     return {**target, "ok": False, "error": "Subagent detail not found"}
             except Exception as exc:  # noqa: BLE001
@@ -1260,9 +1631,25 @@ class BoardRegistry:
                     for f in self._cached_flows
                     if isinstance(f, dict)
                 ],
+                "active": [
+                    (
+                        t.get("id"),
+                        t.get("state"),
+                        t.get("updatedAt"),
+                        t.get("activeChildren"),
+                    )
+                    for t in self._cached_active_threads
+                    if isinstance(t, dict)
+                ],
             }
         payload = json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:16]
 
 
-__all__ = ["BoardRegistry", "discover_harness_runs", "enrich_flow_telemetry"]
+__all__ = [
+    "BoardRegistry",
+    "_active_thread_sort_key",
+    "_live_flow_to_active_thread",
+    "discover_harness_runs",
+    "enrich_flow_telemetry",
+]

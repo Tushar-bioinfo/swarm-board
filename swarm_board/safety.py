@@ -51,6 +51,8 @@ _DENIED_GLOB_RE = re.compile(
 
 def redact_if_secret_name(path_str: str) -> str | None:
     """Return a denial reason if any segment or filename matches a secret/credential rule."""
+    if "\x00" in path_str:
+        return "Denied invalid null byte in path"
     norm = path_str.replace("\\", "/") if "\\" in path_str else path_str
     parts = [seg for seg in norm.split("/") if seg]
     name = parts[-1] if parts else ""
@@ -77,7 +79,7 @@ def is_path_allowed(target_path: str, allowed_roots: list[str]) -> tuple[bool, s
         return False, raw_reason
     try:
         resolved_target = os.path.realpath(target_path)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return False, f"Cannot resolve path: {exc}"
 
     resolved_reason = redact_if_secret_name(resolved_target)
@@ -89,7 +91,7 @@ def is_path_allowed(target_path: str, allowed_roots: list[str]) -> tuple[bool, s
             continue
         try:
             resolved_root = os.path.realpath(root)
-        except OSError:
+        except (OSError, ValueError):
             continue
         try:
             common = os.path.commonpath([resolved_root, resolved_target])
@@ -102,16 +104,27 @@ def is_path_allowed(target_path: str, allowed_roots: list[str]) -> tuple[bool, s
 
 def _resolve_candidate(target_path: str, allowed_roots: list[str]) -> tuple[bool, str | None]:
     """Resolve relative or absolute target_path against allowed_roots safely."""
+    raw_reason = redact_if_secret_name(target_path)
+    if raw_reason:
+        return False, raw_reason
     p = Path(target_path)
     if p.is_absolute():
         return is_path_allowed(target_path, allowed_roots)
+    last_denied: str | None = None
+    any_allowed = False
     for root in allowed_roots:
         if not root:
             continue
         candidate = str(Path(root) / p)
         ok, res = is_path_allowed(candidate, [root])
-        if ok and res and os.path.exists(res):
-            return True, res
+        if ok and res:
+            any_allowed = True
+            if os.path.exists(res):
+                return True, res
+        elif res:
+            last_denied = res
+    if not any_allowed and last_denied:
+        return False, last_denied
     return False, "Not found under this project"
 
 
