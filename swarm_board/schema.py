@@ -415,6 +415,8 @@ def make_agent(
     verdict: str | None = None,
     links: list[dict[str, Any]] | None = None,
     output_ids: list[str] | None = None,
+    label: str | None = None,
+    task: str | None = None,
 ) -> dict[str, Any]:
     """Construct a normalized Agent object."""
     norm_state = normalize_state(state)
@@ -435,6 +437,8 @@ def make_agent(
         "id": agent_id,
         "parent": parent,
         "name": name,
+        "label": label,
+        "task": task,
         "role": role,
         "workstream": workstream,
         "lab": norm_lab,

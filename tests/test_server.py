@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import http.client
 import json
 import os
@@ -14,16 +15,24 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from urllib.parse import quote
 
 from swarm_board.adapters import BoardRegistry
 from swarm_board.server import (
+    DEFAULT_IDLE_SECONDS,
     REPO_ROOT,
     SERVER_VERSION,
     create_server,
+    detect_tailscale_ipv4,
     get_state_dir,
+    is_loopback_host,
+    is_tailscale_ipv4,
     is_valid_host_header,
     parse_byte_range,
+    resolve_bind_host,
+    resolve_idle_seconds,
+    resolve_open_in_preview,
 )
 
 
@@ -138,6 +147,7 @@ class ServerUnitAndApiTests(unittest.TestCase):
                 "rates_path": self.root / "no-rates",
                 "usage_cache_path": self.root / "no-usage",
                 "env_id": "env-test-123",
+                "now_ts": datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc).timestamp(),
             },
             cache_ttl_s=0.0,
         )
@@ -278,6 +288,7 @@ class ServerUnitAndApiTests(unittest.TestCase):
         self.assertEqual(health["pid"], os.getpid())
         self.assertEqual(health["port"], self.port)
         self.assertGreaterEqual(health["uptime_s"], 0.0)
+        self.assertEqual(health["idle_seconds"], 0.0)
         self.assertEqual(health["clients"], 0)
         self.assertEqual(health["version"], SERVER_VERSION)
         self.assertIn("flows_count", health)
@@ -477,6 +488,92 @@ class ServerUnitAndApiTests(unittest.TestCase):
             self.assertEqual(st_m, 405)
             self.assertEqual(hdrs_m["allow"], "GET, HEAD")
 
+    def test_tailscale_host_resolution_header_validation_and_preview_policy(self) -> None:
+        self.assertTrue(is_tailscale_ipv4("100.73.34.46"))
+        self.assertTrue(is_tailscale_ipv4("100.64.0.1"))
+        self.assertFalse(is_tailscale_ipv4("192.168.1.5"))
+        self.assertFalse(is_tailscale_ipv4("0.0.0.0"))
+        self.assertTrue(is_loopback_host("127.0.0.1"))
+        self.assertTrue(is_loopback_host("localhost"))
+        self.assertFalse(is_loopback_host("100.73.34.46"))
+
+        # Allowed hosts validation alongside loopback
+        allowed = ["100.73.34.46", "vmi3773409.tail4e88e4.ts.net."]
+        for ok_host in (
+            "100.73.34.46",
+            "100.73.34.46:18420",
+            "vmi3773409.tail4e88e4.ts.net",
+            "vmi3773409.tail4e88e4.ts.net:18420",
+            "VMI3773409.TAIL4E88E4.TS.NET.:18420",
+        ):
+            self.assertTrue(is_valid_host_header(ok_host, allowed_hosts=allowed), ok_host)
+        for bad_host in (
+            "evil.com:18420",
+            "100.73.34.46.evil.com:18420",
+            "100.73.34.46:99999",
+            "100.73.34.46:0",
+            "100.73.34.46:notaport",
+        ):
+            self.assertFalse(is_valid_host_header(bad_host, allowed_hosts=allowed), bad_host)
+
+        # Reject unsafe bind hosts
+        for bad_bind in ("0.0.0.0", "80.190.78.82", "192.168.1.5", "evil.com"):
+            with self.assertRaises(ValueError):
+                resolve_bind_host(bad_bind, use_env_and_config=False)
+
+        self.assertEqual(resolve_bind_host("100.73.34.46", use_env_and_config=False), "100.73.34.46")
+        with mock.patch("swarm_board.server.detect_tailscale_ipv4", return_value="100.73.34.46"):
+            self.assertEqual(resolve_bind_host("tailscale", use_env_and_config=False), "100.73.34.46")
+
+        # Precedence: explicit > env > config > default
+        with mock.patch.dict(
+            os.environ,
+            {"SWARM_BOARD_HOST": "100.73.34.46"},
+            clear=False,
+        ):
+            self.assertEqual(resolve_bind_host(None, config={"host": "127.0.0.1"}), "100.73.34.46")
+            self.assertEqual(resolve_bind_host("127.0.0.1", config={"host": "100.73.34.46"}), "127.0.0.1")
+
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("SWARM_BOARD_HOST", "SWARM_BOARD_OPEN_IN_PREVIEW")}
+        with mock.patch.dict(os.environ, clean_env, clear=True):
+            self.assertEqual(resolve_bind_host(None, config={}), "127.0.0.1")
+            self.assertEqual(resolve_bind_host(None, config={"host": "100.73.34.46"}), "100.73.34.46")
+            self.assertTrue(resolve_open_in_preview("127.0.0.1", config={}))
+            self.assertFalse(resolve_open_in_preview("100.73.34.46", config={}))
+            self.assertFalse(resolve_open_in_preview("127.0.0.1", config={"open_in_preview": False}))
+            self.assertTrue(resolve_open_in_preview("100.73.34.46", config={"open_in_preview": True}))
+
+        with mock.patch.dict(os.environ, {"SWARM_BOARD_OPEN_IN_PREVIEW": "0"}, clear=False):
+            self.assertFalse(resolve_open_in_preview("127.0.0.1", config={"open_in_preview": True}))
+
+        # Idle timeout default and resolution (explicit > env > config > default)
+        self.assertEqual(DEFAULT_IDLE_SECONDS, 7200.0)
+        clean_idle_env = {k: v for k, v in os.environ.items() if k != "SWARM_BOARD_IDLE_SECONDS"}
+        with mock.patch.dict(os.environ, clean_idle_env, clear=True):
+            self.assertEqual(resolve_idle_seconds(None, config={}), 7200.0)
+            self.assertEqual(resolve_idle_seconds(None, config={"idle_seconds": 3600}), 3600.0)
+            self.assertEqual(resolve_idle_seconds(None, config={"idle_seconds": 10800}), 10800.0)
+            self.assertEqual(resolve_idle_seconds(None, config={"idle_seconds": 0}), 0.0)
+            self.assertEqual(resolve_idle_seconds(None, config={"idle_seconds": -5}), 0.0)
+            for bad_cfg in (True, False, "bad", "", float("nan"), float("inf")):
+                self.assertEqual(
+                    resolve_idle_seconds(None, config={"idle_seconds": bad_cfg}),
+                    7200.0,
+                    f"bad_cfg={bad_cfg!r}",
+                )
+
+        with mock.patch.dict(os.environ, {"SWARM_BOARD_IDLE_SECONDS": "5400"}, clear=False):
+            self.assertEqual(resolve_idle_seconds(None, config={"idle_seconds": 3600}), 5400.0)
+            self.assertEqual(resolve_idle_seconds(10800, config={"idle_seconds": 3600}), 10800.0)
+            self.assertEqual(
+                resolve_idle_seconds(None, use_env_and_config=False, config={"idle_seconds": 3600}),
+                7200.0,
+            )
+
+        for bad_explicit in (True, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                resolve_idle_seconds(bad_explicit)  # type: ignore[arg-type]
+
     def test_sse_events_ready_update_heartbeat_and_zero_idle_poller(self) -> None:
         # Before connecting, zero SSE clients and no background poller thread active.
         self.assertEqual(self.server.sse_hub.client_count(), 0)
@@ -579,6 +676,10 @@ class ServerLifecycleSubprocessTests(unittest.TestCase):
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["SWARM_BOARD_STATE_DIR"] = str(self.state_dir)
+        env["SWARM_BOARD_CONFIG"] = str(Path(self.tmp.name) / "no-config.json")
+        env.pop("SWARM_BOARD_HOST", None)
+        env.pop("SWARM_BOARD_OPEN_IN_PREVIEW", None)
+        env.pop("SWARM_BOARD_IDLE_SECONDS", None)
         return env
 
     def test_ensure_script_idempotent_and_hook_mode(self) -> None:
@@ -824,6 +925,171 @@ class ServerLifecycleSubprocessTests(unittest.TestCase):
         st_stop2 = json.loads(p_stop2.stdout.strip())
         self.assertTrue(st_stop2["ok"])
         self.assertFalse(st_stop2["stopped"])
+
+    def test_config_file_open_in_preview_and_tailscale_lifecycle(self) -> None:
+        cfg_path = Path(self.tmp.name) / "swarm-config.json"
+        cfg_path.write_text(
+            json.dumps({"host": "127.0.0.1", "open_in_preview": False}),
+            encoding="utf-8",
+        )
+        env = self._env()
+        env["SWARM_BOARD_CONFIG"] = str(cfg_path)
+
+        p1 = subprocess.run(
+            [str(self.script_path), "--ensure", "--port", "0", "--idle-seconds", "30"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        res1 = json.loads(p1.stdout.strip())
+        self.assertTrue(res1["ok"])
+        self.assertEqual(res1["host"], "127.0.0.1")
+        self.assertEqual(res1["local_url"], f"http://127.0.0.1:{res1['port']}")
+        self.assertFalse(res1["open_in_preview"])
+        pid1 = int(res1["pid"])
+        self._pids_to_cleanup.append(pid1)
+
+        # Bad explicit host fails cleanly without starting
+        p_bad = subprocess.run(
+            [str(self.script_path), "--ensure", "--host", "0.0.0.0", "--port", "0"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+        self.assertEqual(p_bad.returncode, 1)
+        self.assertFalse(json.loads(p_bad.stdout.strip())["ok"])
+
+        try:
+            ts_ip = detect_tailscale_ipv4()
+        except RuntimeError:
+            return
+
+        # Switching same state_dir to --host tailscale stops loopback server and binds ts_ip
+        p_ts = subprocess.run(
+            [str(self.script_path), "--ensure", "--host", "tailscale", "--port", "0", "--idle-seconds", "30"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        res_ts = json.loads(p_ts.stdout.strip())
+        self.assertTrue(res_ts["ok"])
+        self.assertTrue(res_ts["started"])
+        self.assertEqual(res_ts["host"], ts_ip)
+        self.assertFalse(res_ts["open_in_preview"])
+        self.assertEqual(res_ts["url"], f"http://{ts_ip}:{res_ts['port']}")
+        self.assertEqual(res_ts["local_url"], f"http://127.0.0.1:{res_ts['port']}")
+        ts_pid = int(res_ts["pid"])
+        ts_port = int(res_ts["port"])
+        self._pids_to_cleanup.append(ts_pid)
+        self.assertNotEqual(ts_pid, pid1)
+
+        # Previous loopback server should be stopped
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid1, 0)
+                time.sleep(0.05)
+            except OSError:
+                break
+        with self.assertRaises(OSError):
+            os.kill(pid1, 0)
+
+        # Health over both Tailscale IP and companion 127.0.0.1 accepts valid Hosts and rejects evil.com
+        for probe_host in (ts_ip, "127.0.0.1"):
+            conn = http.client.HTTPConnection(probe_host, ts_port, timeout=3.0)
+            try:
+                conn.request("GET", "/health", headers={"Host": f"{probe_host}:{ts_port}"})
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200, probe_host)
+                h_data = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(h_data["host"], ts_ip)
+                self.assertEqual(h_data["hosts"], [ts_ip, "127.0.0.1"])
+                self.assertEqual(h_data["local_url"], f"http://127.0.0.1:{ts_port}")
+                self.assertEqual(h_data["pid"], ts_pid)
+
+                conn.request("GET", "/health", headers={"Host": f"evil.com:{ts_port}"})
+                resp_bad = conn.getresponse()
+                resp_bad.read()
+                self.assertEqual(resp_bad.status, 403, probe_host)
+            finally:
+                conn.close()
+
+        # --status and --stop work cleanly for Tailscale server
+        p_st = subprocess.run(
+            [str(self.script_path), "--status"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        st_data = json.loads(p_st.stdout.strip())
+        self.assertTrue(st_data["running"])
+        self.assertEqual(st_data["host"], ts_ip)
+        self.assertEqual(st_data["local_url"], f"http://127.0.0.1:{ts_port}")
+        self.assertFalse(st_data["open_in_preview"])
+
+        p_sp = subprocess.run(
+            [str(self.script_path), "--stop"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        sp_data = json.loads(p_sp.stdout.strip())
+        self.assertTrue(sp_data["stopped"])
+        self.assertEqual(sp_data["host"], ts_ip)
+
+        # Both listeners must be closed after --stop
+        for probe_host in (ts_ip, "127.0.0.1"):
+            with self.assertRaises(OSError):
+                socket.create_connection((probe_host, ts_port), timeout=1.0).close()
+
+    def test_config_file_idle_seconds_lifecycle(self) -> None:
+        cfg_path = Path(self.tmp.name) / "idle-config.json"
+        cfg_path.write_text(
+            json.dumps({"host": "127.0.0.1", "idle_seconds": 3600}),
+            encoding="utf-8",
+        )
+        env = self._env()
+        env["SWARM_BOARD_CONFIG"] = str(cfg_path)
+
+        p1 = subprocess.run(
+            [str(self.script_path), "--ensure", "--port", "0"],
+            cwd=str(REPO_ROOT),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=True,
+        )
+        res1 = json.loads(p1.stdout.strip())
+        self.assertTrue(res1["ok"])
+        pid1 = int(res1["pid"])
+        port1 = int(res1["port"])
+        self._pids_to_cleanup.append(pid1)
+
+        conn = http.client.HTTPConnection("127.0.0.1", port1, timeout=2.0)
+        try:
+            conn.request("GET", "/health", headers={"Host": f"127.0.0.1:{port1}"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            health = json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(health["idle_seconds"], 3600.0)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

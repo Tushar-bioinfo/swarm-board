@@ -57,7 +57,7 @@ details[open]>summary .lbox::before,.lbox.on::before{content:"\2212"}
 .pgb{font:500 16px/1.3 var(--f-ui);color:var(--mist);background:none;border:0;padding:6px 0;cursor:pointer;position:relative;transition:color var(--m-hover) var(--ease)}
 .pgb:hover,.pgb[aria-pressed=true]{color:var(--ink)}
 .app.stp .pgb[data-page=stats]::after{content:"";position:absolute;left:0;right:0;bottom:-2px;height:2px;background:var(--accent)}
-.app.stp.stp :is(.fhead,.cols,.filt){display:none}
+.app.stp.stp :is(.fhead,.cols,.filt>.lfold){display:none}
 .needs{font:500 17px var(--f-ui);color:var(--ink);background:none;border:0;cursor:pointer;padding:6px 0;white-space:nowrap}
 .needs b{color:var(--accent);font-weight:600;margin-left:6px}
 .conn{display:inline-flex;align-items:center;gap:6px;font:400 15px var(--f-mono);color:var(--mist);white-space:nowrap}

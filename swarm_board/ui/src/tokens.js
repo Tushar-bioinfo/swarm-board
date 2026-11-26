@@ -91,6 +91,6 @@ function tokIn(a, s, o) {
 function token(a, x, y, s, o) {
   o = o || {};
   const cls = 'nd' + (a.state === 'running' ? ' run' : '') + (o.sel ? ' sel' : '') + (o.dim ? ' dim' : '') + (o.lit ? ' lit' : '') + (o.cls ? ' ' + o.cls : '');
-  return `<g class="${cls}" data-agent="${esc(a.id)}" ${BATR(`${aName(a)}, ${a.role}, ${stateWord(a)}`)}${o.attr || ''}><g transform="translate(${f1(x)} ${f1(y)})">${tokIn(a, s, o)}<circle class="fx" r="${f1(Math.max(s / 2 + 6, 14))}" fill="transparent"/></g></g>`;
+  return `<g class="${cls}" data-agent="${esc(a.id)}" ${BATR(`${aLabel(a)}, ${a.role}, ${stateWord(a)}`)}${o.attr || ''}><g transform="translate(${f1(x)} ${f1(y)})">${tokIn(a, s, o)}<circle class="fx" r="${f1(Math.max(s / 2 + 6, 14))}" fill="transparent"/></g></g>`;
 }
 const emb = (l, st, s = 16) => `<svg class="emb" width="${s + 4}" height="${s + 4}" viewBox="${-(s + 4) / 2} ${-(s + 4) / 2} ${s + 4} ${s + 4}" aria-hidden="true">${tokIn({ lab: l, state: st || 'done' }, s)}</svg>`;

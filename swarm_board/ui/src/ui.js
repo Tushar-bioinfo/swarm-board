@@ -36,8 +36,8 @@ function go(view, arg, fi) {
 }
 function crumbs(f) {
   const p = [['overview', '', 'Overview']];
-  if (S.view === 'agent') { const a = agentOf(f, S.arg); p.push(['agent', S.arg, a ? trunc(aName(a), 28) : S.arg]); }
-  if (S.view === 'output' || S.view === 'file') { const o = getOut(f, S.arg, S.view), a = o && o.by ? agentOf(f, o.by) : null; if (o && o.by) p.push(['agent', o.by, a ? trunc(aName(a), 24) : o.by]); p.push([S.view, S.arg, o ? o.title : S.arg]); }
+  if (S.view === 'agent') { const a = agentOf(f, S.arg); p.push(['agent', S.arg, a ? trunc(aLabel(a), 28) : S.arg]); }
+  if (S.view === 'output' || S.view === 'file') { const o = getOut(f, S.arg, S.view), a = o && o.by ? agentOf(f, o.by) : null; if (o && o.by) p.push(['agent', o.by, a ? trunc(aLabel(a), 24) : o.by]); p.push([S.view, S.arg, o ? o.title : S.arg]); }
   if (['compare', 'feed', 'needs', 'keys'].includes(S.view)) p.push([S.view, S.arg, { compare: 'Compare', feed: 'Feed', needs: 'Needs you', keys: 'Keyboard' }[S.view]]);
   return `<nav class="crumb" aria-label="Breadcrumb">${p.map((x, i) => i === p.length - 1 ? `<span class="cur">${esc(x[2])}</span>` : `<button data-go="${x[0]}" data-arg="${esc(x[1])}">${esc(x[2])}</button><span>›</span>`).join('')}</nav>`;
 }
@@ -97,7 +97,9 @@ function layoutApp() {
   APP.style.setProperty('--colh', Math.max(320, ah - top - 8) + 'px');
 }
 function renderAll() {
-  renderBar(); renderHead(); applySplit(); renderMapFrame(); renderOuts(); renderSide(); renderStats(); requestAnimationFrame(layoutApp);
+  renderBar();
+  if (S.page === 'stats') { clearInterval(TT); renderStats(); return; }
+  renderHead(); applySplit(); renderMapFrame(); renderOuts(); renderSide(); renderStats(); requestAnimationFrame(layoutApp);
 }
 function setW() {
   const w = (S.appW = APP.clientWidth), m = w >= 1060 ? 'wide' : w >= 680 ? 'medium' : 'narrow';

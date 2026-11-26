@@ -134,8 +134,8 @@ function citeCard(b) {
 function nodeCard(g) {
   const f = flow(), a = agentOf(f, g.dataset.agent);
   if (!a) return;
-  const last = a.result || a.last || (a.verdict ? '✓ ' + a.verdict : '');
-  showPop(g, `<div class="nm">${esc(aName(a))}</div><div class="mono mist fx">${emb(a.lab, a.state)}${esc(labN(a.lab))}${a.model ? ' · ' + esc(a.model) : ''}</div>
+  const lb = aLabel(a), tk = aTask(a), last = a.result || a.last || (a.verdict ? '✓ ' + a.verdict : '');
+  showPop(g, `<div class="nm">${esc(lb)}</div>${tk && tk !== lb ? `<div class="mist cl2">${esc(tk)}</div>` : ''}<div class="mono mist fx">${emb(a.lab, a.state)}${esc(labN(a.lab))}${a.model ? ' · ' + esc(a.model) : ''}</div>
     <div class="fx" style="color:${isStop(a) ? C.bad : C.mist}">${sIcon(a.state, stateCol(a))}${esc(stateWord(a))}</div>
     ${a.durS != null || a.costUsd != null ? `<div class="mist">${a.durS != null ? fmtDur(a.durS) + ' · ' : ''}${fmtCost(a.costUsd, a.costEstimated)}</div>` : ''}
     ${last ? `<div class="cl2">${esc(last)}</div>` : ''}<div class="ft">Click to open · o opens chat</div>`, labC(a.lab));

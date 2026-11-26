@@ -165,6 +165,16 @@ def _clean_excerpt(text: str | None, limit: int = 220) -> str | None:
     return None
 
 
+def _bound_hint(text: Any, limit: int = 400) -> str | None:
+    """Strip outer whitespace and bound a label hint string to `limit` chars."""
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    return cleaned[:limit]
+
+
 def _extract_verdict(response: str | None) -> str | None:
     """Extract a concise verdict label from the opening header/bold line of a committee response."""
     if not response or not isinstance(response, str):
@@ -686,9 +696,11 @@ def _parse_committee_dir(
 
         # Read brief text for referenced project files (only first brief needed if identical,
         # but reading small .md briefs is cheap and handles per-seat differences).
+        brief_text: str | None = None
         if md_path.is_file() and md_size and md_size <= 65_536:
             try:
-                texts_for_refs.append(md_path.read_text(encoding="utf-8", errors="replace"))
+                brief_text = md_path.read_text(encoding="utf-8", errors="replace")
+                texts_for_refs.append(brief_text)
             except OSError:
                 pass
 
@@ -801,6 +813,19 @@ def _parse_committee_dir(
             output_ids=agent_output_ids,
         )
         agent["costEstimated"] = cost_estimated
+        seat_parts = [f"Seat {seat_num}"]
+        if role:
+            seat_parts.append(str(role))
+        if model:
+            seat_parts.append(str(model))
+        seat_prefix = " · ".join(seat_parts)
+        committee_prompt = f"{seat_prefix}: {question}" if question else (brief_text or seat_prefix)
+        agent["_labelHint"] = {
+            "prompt": _bound_hint(committee_prompt, 360),
+            "slug": _bound_hint(f"seat-{seat_num}", 400),
+            "planTask": _bound_hint(question, 400),
+            "rawTitle": _bound_hint(f"Seat {seat_num} · {label}", 400),
+        }
         agents.append(agent)
 
     for ref_idx, (rel_title, ref_path, ref_size, ref_mtime) in enumerate(
@@ -821,7 +846,7 @@ def _parse_committee_dir(
         )
 
     started_at = to_iso_utc(min(timestamps)) if timestamps else None
-    updated_at = to_iso_utc(now_ts if running_count > 0 else (max(timestamps) if timestamps else None))
+    updated_at = to_iso_utc(max(timestamps)) if timestamps else None
     decision = _derive_decision(seat_verdicts, running_count)
 
     title_suffix = f" ({tier})" if tier else ""
@@ -972,6 +997,13 @@ def _parse_orchestrate_dir(
         md_path = run_dir / f"{tid}.md"
         out_path = run_dir / f"{tid}.out.json"
         md_mtime, md_size = _safe_stat_mtime_size(md_path)
+        brief_head: str | None = None
+        if md_path.is_file() and md_size:
+            try:
+                with md_path.open("r", encoding="utf-8", errors="replace") as bfh:
+                    brief_head = _bound_hint(bfh.read(1024), 360)
+            except OSError:
+                brief_head = None
         out_mtime, out_size = _safe_stat_mtime_size(out_path)
         out_data = _safe_read_json(out_path) if (out_size and out_size > 0) else None
         if not isinstance(out_data, dict):
@@ -1108,6 +1140,17 @@ def _parse_orchestrate_dir(
             output_ids=agent_output_ids,
         )
         agent["costEstimated"] = cost_estimated
+        plan_task_str = (
+            f"{title} — {goal}"
+            if (goal and title and str(goal).strip() not in title)
+            else (title or goal)
+        )
+        agent["_labelHint"] = {
+            "prompt": brief_head or _bound_hint(goal, 360),
+            "slug": _bound_hint(tid, 400),
+            "planTask": _bound_hint(plan_task_str, 400),
+            "rawTitle": _bound_hint(title, 400),
+        }
         agents.append(agent)
 
     for ref_idx, (rel_title, ref_path, ref_size, ref_mtime) in enumerate(
@@ -1128,7 +1171,7 @@ def _parse_orchestrate_dir(
         )
 
     started_at = to_iso_utc(min(timestamps)) if timestamps else None
-    updated_at = to_iso_utc(now_ts if running_count > 0 else (max(timestamps) if timestamps else None))
+    updated_at = to_iso_utc(max(timestamps)) if timestamps else None
 
     flow = make_flow(
         f"orchestrate:{run_dir.name}",
@@ -1258,6 +1301,25 @@ def _parse_sessions_ledger(
                 links=links,
             )
             agent["costEstimated"] = cost_estimated
+            hint_parts = [
+                p
+                for p in (
+                    str(role) if role else None,
+                    str(model) if model else None,
+                    str(cli) if cli else None,
+                )
+                if p
+            ]
+            hint_summary = " · ".join(hint_parts) if hint_parts else None
+            agent["_labelHint"] = {
+                "prompt": _bound_hint(rec.get("prompt") or hint_summary, 360),
+                "slug": _bound_hint(
+                    f"{cli}-{role}" if cli and role else (role or cli),
+                    400,
+                ),
+                "planTask": _bound_hint(rec.get("task"), 400),
+                "rawTitle": _bound_hint(f"{model or cli or 'agent'} ({role})", 400),
+            }
             agents.append(agent)
 
         flows.append(

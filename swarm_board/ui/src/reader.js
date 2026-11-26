@@ -4,7 +4,7 @@ const ICON = { markdown: '▤', brief: '▤', verdict: '⚖', json: '{}', table:
 let READ = null;
 function byLine(f, id) {
   const a = id && agentOf(f, id);
-  return a ? `by <span style="color:${labC(a.lab)}">${esc(aName(a))}</span> · ${esc(labN(a.lab))}${a.model ? ` <span class="mono">${esc(a.model)}</span>` : ''}` : '';
+  return a ? `by <span style="color:${labC(a.lab)}">${esc(aLabel(a))}</span> · ${esc(labN(a.lab))}${a.model ? ` <span class="mono">${esc(a.model)}</span>` : ''}` : '';
 }
 function parseVerdict(o) {
   if (!o || o.body == null) return null;
@@ -62,7 +62,7 @@ function bodyFor(o, f) {
     const tag = isVid ? `<video ${PRE} src="${esc(src)}"></video>` : `<audio ${PRE} src="${esc(src)}"></audio>`;
     return { html: src ? `<div class="media">${tag}<p class="meta mono">${esc(pth)}${o.size ? ' · ' + fmtKB(o.size) : ''}</p></div>` : EMP(`${isVid ? 'Video' : 'Audio'} path not available.`), heads: [], raw: pth };
   }
-  if (o.kind === 'post') { const p = o.post, a = agentOf(f, p.author), r = md(p.text); return { html: `<div class="post"><div class="by" style="color:${labC(a && a.lab)}">${esc(a ? aName(a) : p.author)}<span class="t">#${p.id}${p.at ? ' · ' + esc(p.at) : ''}</span></div><div class="md">${r.html}</div></div>`, heads: [], raw: p.text }; }
+  if (o.kind === 'post') { const p = o.post, a = agentOf(f, p.author), r = md(p.text); return { html: `<div class="post"><div class="by" style="color:${labC(a && a.lab)}">${esc(a ? aLabel(a) : p.author)}<span class="t">#${p.id}${p.at ? ' · ' + esc(p.at) : ''}</span></div><div class="md">${r.html}</div></div>`, heads: [], raw: p.text }; }
   if (o.kind === 'cfile') {
     let sp = o.cf && o.cf.lines, note = o.cf ? `${esc(o.path)} (${o.cf.n} lines)` : '';
     if (!sp) {

@@ -25,6 +25,8 @@ const S = {
 };
 const flow = () => FL[S.fi] || null;
 const aName = (a) => (a && (a.name || a.id)) || '';
+const aLabel = (a) => (a && (a.label || a.name || a.id)) || '';
+const aTask = (a) => (a && (a.task || a.name || a.id)) || '';
 const trunc = (s, n) => { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; };
 const rootOf = (f) => (f && f.agents && f.agents.length ? f.agents.find((a) => !a.parent) || f.agents.find((a) => a.role === 'root') || f.agents[0] : null);
 function flowAge(f) {
@@ -96,8 +98,8 @@ function needsOf(f) {
   intr.forEach((a) => (byLab[a.lab] = byLab[a.lab] || []).push(a));
   Object.keys(byLab).forEach((l) => items.push({ key: f.id + ':int:' + l, st: 'interrupted', ag: byLab[l],
     text: `${byLab[l].length} ${labN(l)} worker${byLab[l].length > 1 ? 's were' : ' was'} interrupted`, acts: ['chat'] }));
-  f.agents.filter((a) => a.state === 'waiting').forEach((a) => items.push({ key: f.id + ':w:' + a.id, st: 'waiting', ag: [a], text: `${trunc(aName(a), 32)} is waiting for your approval`, acts: ['chat'] }));
-  f.agents.filter((a) => a.state === 'stale').forEach((a) => items.push({ key: f.id + ':s:' + a.id, st: 'stale', ag: [a], text: `${trunc(aName(a), 32)} has been quiet for a while`, acts: ['chat'] }));
+  f.agents.filter((a) => a.state === 'waiting').forEach((a) => items.push({ key: f.id + ':w:' + a.id, st: 'waiting', ag: [a], text: `${trunc(aLabel(a), 32)} is waiting for your approval`, acts: ['chat'] }));
+  f.agents.filter((a) => a.state === 'stale').forEach((a) => items.push({ key: f.id + ':s:' + a.id, st: 'stale', ag: [a], text: `${trunc(aLabel(a), 32)} has been quiet for a while`, acts: ['chat'] }));
   if (f.decision && f.decision.qualifier) items.push({ key: f.id + ':dec', st: 'cond', ag: [], text: 'Decision is conditional: read the conditions', acts: ['compare'] });
   return items.map((i) => Object.assign(i, { flow: f })).filter((i) => !S.done[i.key]);
 }

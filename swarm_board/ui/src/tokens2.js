@@ -26,7 +26,7 @@ function sparks(a, x, y, R) {
   const a0 = m === 1 ? ang(0) - .3 : ang(0), a1 = m === 1 ? ang(0) + .3 : ang(m - 1);
   s += `<path d="M${pt(a0, R + 7.5)}A${R + 7.5} ${R + 7.5} 0 0 1 ${pt(a1, R + 7.5)}" stroke="transparent" stroke-width="12" fill="none"/>`;
   if (n > 12) s += `<text x="${x}" y="${f1(y - R - 26)}" text-anchor="middle" font-size="15" fill="${C.bad}">+${n - 12}</text>`;
-  return `<g class="spk" data-agent="${esc(a.id)}" ${BATR(`${n} error${n > 1 ? 's' : ''} on ${aName(a)}`)}>${s}</g>`;
+  return `<g class="spk" data-agent="${esc(a.id)}" ${BATR(`${n} error${n > 1 ? 's' : ''} on ${aLabel(a)}`)}>${s}</g>`;
 }
 function bead(p, x, y, to, out) {
   const open = S.view === 'output' && S.arg === 'post-' + p.id;

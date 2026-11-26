@@ -188,6 +188,16 @@ def _truncate(text: str | None, limit: int = 160) -> str | None:
     return cleaned[: limit - 1].rstrip() + "…"
 
 
+def _bound_hint(text: Any, limit: int = 400) -> str | None:
+    """Strip outer whitespace and bound a label hint string to `limit` chars."""
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    return cleaned[:limit]
+
+
 def _is_internal_path(path_str: str) -> bool:
     norm = path_str.replace("\\", "/")
     return any(
@@ -787,6 +797,7 @@ def _build_swarm_flow(
     goal_str: str | None = None
     workstreams: list[dict[str, str]] = []
     ws_by_member: dict[str, str] = {}
+    plan_tasks: dict[str, str] = {}
     if isinstance(plan_json, dict):
         goal_obj = plan_json.get("goal")
         if isinstance(goal_obj, dict):
@@ -798,6 +809,23 @@ def _build_swarm_flow(
                 goal_str = g_title or g_line or None
         elif isinstance(goal_obj, str) and goal_obj.strip():
             goal_str = goal_obj.strip()
+
+        raw_tasks = plan_json.get("tasks")
+        if isinstance(raw_tasks, dict):
+            for t_name, t_desc in raw_tasks.items():
+                if not isinstance(t_name, str) or not t_name.strip():
+                    continue
+                if isinstance(t_desc, str):
+                    bounded = _bound_hint(t_desc, 400)
+                elif isinstance(t_desc, dict):
+                    bounded = _bound_hint(
+                        t_desc.get("title") or t_desc.get("task") or t_desc.get("description"),
+                        400,
+                    )
+                else:
+                    bounded = None
+                if bounded:
+                    plan_tasks[t_name] = bounded
 
         raw_threads = plan_json.get("threads")
         if isinstance(raw_threads, list):
@@ -1111,6 +1139,15 @@ def _build_swarm_flow(
         if role in HELPER_ROLES:
             agent["isHelper"] = True
         agent["costEstimated"] = cost_estimated
+        plan_task = plan_tasks.get(m_name) or (
+            _bound_hint(goal_str, 400) if role == "coordinator" else None
+        )
+        agent["_labelHint"] = {
+            "prompt": _bound_hint(brief_text, 360),
+            "slug": None,
+            "planTask": plan_task,
+            "rawTitle": _bound_hint(m_name, 400),
+        }
         agents.append(agent)
 
     for p in board_posts:

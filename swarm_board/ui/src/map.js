@@ -9,7 +9,7 @@ function tw(t, size, wt, mono) {
   return w * size / 100;
 }
 function shortNames(sibs) {
-  const names = sibs.map((a) => aName(a));
+  const names = sibs.map((a) => aLabel(a));
   let p = 0;
   while (names.length > 1 && names.every((x) => x[p] && x[p] === names[0][p])) p++;
   const cut = p >= 3 ? p : 0;
@@ -26,12 +26,13 @@ MapB.prototype.place = function () {
       if (st == null || st === '' || (Array.isArray(st) && !st.length)) continue;
       const P = Array.isArray(st) ? st : [[st]], mo = (p) => (p[2] == null ? o.mono : p[2]);
       const w = P.reduce((s, p) => s + tw(p[0], o.size, p[3] || o.wt, mo(p)) + (o.ls ? o.ls * p[0].length : 0), 0);
-      const x0 = o.anchor === 'middle' ? o.x - w / 2 : o.anchor === 'end' ? o.x - w : o.x;
+      let x = o.x, x0 = o.anchor === 'middle' ? x - w / 2 : o.anchor === 'end' ? x - w : x;
+      if (o.edge && x0 < 1) { x += 1 - x0; x0 = 1; }
       const b = [x0, o.y - o.size * 0.82, x0 + w, o.y + o.size * 0.26, 1];
       if (b[0] < -2 || b[2] > this.W + 2 || (o.maxX && b[2] > o.maxX) || hit(b)) continue;
       this.boxes.push(b);
       const body = Array.isArray(st) ? P.map((p) => `<tspan${p[1] ? ` fill="${p[1]}"` : ''}${mo(p) !== o.mono ? ` class="${mo(p) ? 'mo' : 'ui'}"` : ''}${p[3] ? ` font-weight="${p[3]}"` : ''}>${esc(p[0])}</tspan>`).join('') : esc(st);
-      out.push(`<text x="${f1(o.x)}" y="${f1(o.y)}" text-anchor="${o.anchor || 'start'}" font-size="${o.size}" font-weight="${o.wt || 400}"${o.mono ? ' class="mo"' : ''} fill="${o.fill || C.ink}"${o.ls ? ` letter-spacing="${o.ls}"` : ''} data-for="${esc(o.for || '')}" pointer-events="${o.for ? 'auto' : 'none'}">${body}</text>`);
+      out.push(`<text x="${f1(x)}" y="${f1(o.y)}" text-anchor="${o.anchor || 'start'}" font-size="${o.size}" font-weight="${o.wt || 400}"${o.mono ? ' class="mo"' : ''} fill="${o.fill || C.ink}"${o.ls ? ` letter-spacing="${o.ls}"` : ''} data-for="${esc(o.for || '')}" pointer-events="${o.for ? 'auto' : 'none'}">${body}</text>`);
       break;
     }
   }

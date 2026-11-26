@@ -25,13 +25,13 @@ function lanes(f, B, det) {
   });
   const HY = rows.length ? (rows[0][1] + rows[rows.length - 1][1]) / 2 : 60, x0 = HX + rc + 16, x1 = WX - r - 3, wires = {};
   B.node(co, HX, HY, sc, { med: 1, ring: 1, R: rc + 20 });
-  const rnm = aName(co);
-  B.label({ x: Math.max(HX, tw('coordinator', 17, 600) / 2 + 1), y: HY + rc + 36, size: 17, wt: 600, anchor: 'middle', for: co.id, steps: [rnm, trunc(rnm, 14), 'coord.'] });
+  const rnm = aLabel(co);
+  B.label({ x: HX, y: HY + rc + 36, size: 17, wt: 600, anchor: 'middle', edge: 1, maxX: Lx - 4, for: co.id, steps: [rnm, trunc(rnm, 14), 'coord.'] });
   if (det === 'L' && Dt) B.label({ x: HX, y: HY + rc + 58, size: 15, fill: C.mist, anchor: 'middle', steps: [(co.trace || []).reduce((t, x) => t + x[1], 0) + ' calls'] });
   rows.forEach(([a, wy]) => {
     const dx = x1 - x0, P = [[x0, HY], [x0 + 0.5 * dx, HY], [x1 - 0.5 * dx, wy], [x1, wy]];
     wires[a.id] = P; B.cable(P, a); B.node(a, WX, wy, s);
-    const lx = WX + r + 14, sw = stateWord(a), sc2 = isStop(a) ? C.bad : C.mist, short = sw.split(' · ')[0] + (isStop(a) && errN(a) ? ' · ' + errN(a) : ''), nm = aName(a);
+    const lx = WX + r + 14, sw = stateWord(a), sc2 = isStop(a) ? C.bad : C.mist, short = sw.split(' · ')[0] + (isStop(a) && errN(a) ? ' · ' + errN(a) : ''), nm = aLabel(a);
     B.label({ x: lx, y: Dt ? (Sm ? wy + 4 : wy - 3) : wy + 6, size: 17, wt: 600, for: a.id, steps: [nm, trunc(nm, 28), trunc(nm, 16)] });
     if (Dt) B.label({ x: lx, y: Sm ? wy + 24 : wy + 17, size: 15, fill: sc2, for: a.id, steps: Sm ? [short] : [det === 'L' && a.last ? [[sw], ['  ' + trunc(a.last, 42), C.mist]] : null, sw, short] });
   });

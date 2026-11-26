@@ -21,7 +21,7 @@ BUILD_SCRIPT = REPO_ROOT / "swarm_board" / "ui" / "build.py"
 UI_INDEX = REPO_ROOT / "swarm_board" / "ui" / "index.html"
 UI_SIZE_LIMIT = 153_600
 
-VALID_TARGETS = ("antigravity", "claude", "codex")
+VALID_TARGETS = ("antigravity", "claude", "codex", "grok")
 AGY_HOOK_MATCHER = "mcp_t3-code_delegate_task|delegate_task|swarm|invoke_subagent|run_workflow"
 CLAUDE_HOOK_MATCHER = "Agent|Task|TeamCreate|SendMessage|mcp__t3-code__delegate_task"
 
@@ -131,6 +131,8 @@ def detect_targets(home: Path, platform_name: str) -> list[str]:
         detected.append("claude")
     if (home / ".codex").exists() or (use_which and shutil.which("codex")):
         detected.append("codex")
+    if (home / ".grok").exists() or (use_which and shutil.which("grok")):
+        detected.append("grok")
     return detected
 
 
@@ -181,6 +183,8 @@ def _skill_targets_for(target: str, home: Path, platform_name: str) -> list[Path
         return [home / ".claude" / "skills" / "swarm-board"]
     if target == "codex":
         return [home / ".codex" / "skills" / "swarm-board"]
+    if target == "grok":
+        return [home / ".grok" / "skills" / "swarm-board"]
     return []
 
 
@@ -477,6 +481,8 @@ def verify_installation(
                 t_info["hooks"] = "skipped (--no-hooks)"
         elif target == "codex":
             t_info["hooks"] = "n/a (Codex invokes /swarm-board on demand)"
+        elif target == "grok":
+            t_info["hooks"] = "n/a (Grok invokes /swarm-board on demand)"
 
         target_status[target] = t_info
 
@@ -489,7 +495,7 @@ def run_install(argv: list[str] | None = None) -> tuple[int, dict[str, Any]]:
     parser.add_argument(
         "--targets",
         default="auto",
-        help="Comma-separated targets from {antigravity,claude,codex}, or 'auto' (default) / 'all'.",
+        help="Comma-separated targets from {antigravity,claude,codex,grok}, or 'auto' (default) / 'all'.",
     )
     parser.add_argument(
         "--no-hooks",
@@ -545,6 +551,8 @@ def run_install(argv: list[str] | None = None) -> tuple[int, dict[str, Any]]:
                 hook_res: Any = _uninstall_agy_hook(home, dry_run=args.dry_run)
             elif target == "claude":
                 hook_res = _uninstall_claude_hook(home, dry_run=args.dry_run)
+            elif target == "grok":
+                hook_res = "n/a (Grok invokes /swarm-board on demand)"
             else:
                 hook_res = "n/a (Codex invokes /swarm-board on demand)"
             if isinstance(hook_res, dict) and hook_res.get("action") == "error":
@@ -569,6 +577,8 @@ def run_install(argv: list[str] | None = None) -> tuple[int, dict[str, Any]]:
         skills_res = [_sync_symlink(dst, SKILL_SOURCE, dry_run=args.dry_run) for dst in _skill_targets_for(target, home, platform_name)]
         if target == "codex":
             hook_res: Any = "n/a (Codex invokes /swarm-board on demand)"
+        elif target == "grok":
+            hook_res = "n/a (Grok invokes /swarm-board on demand)"
         elif args.no_hooks:
             hook_res = "skipped (--no-hooks)"
         elif target == "antigravity":
@@ -605,7 +615,7 @@ def _format_human(payload: dict[str, Any]) -> str:
         if payload["prep"]["chmod"]:
             lines.append(f"  chmod +x: {', '.join(payload['prep']['chmod'])}")
     if not payload["targets"]:
-        lines.append("  No targets matched (~/.gemini, ~/.claude, ~/.codex not found). Use --targets antigravity,claude,codex if needed.")
+        lines.append("  No targets matched (~/.gemini, ~/.claude, ~/.codex, ~/.grok not found). Use --targets antigravity,claude,codex,grok if needed.")
     for name, info in payload["targets"].items():
         sk = ", ".join(f"{x['path']} ({x['action']})" for x in info["skills"])
         hk = info["hooks"]

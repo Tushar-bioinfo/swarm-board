@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import time
 from typing import Any
@@ -32,6 +33,87 @@ TAIL_READ_BYTES = 24_576
 
 _DEFAULT_RATE_TABLE = RateTable()
 _DEFAULT_USAGE_INDEX = UsageIndex()
+_CLAUDE_HEAD_CACHE: dict[str, tuple[int, int, str | None]] = {}
+_TRUNCATED_CONTENT_RE = re.compile(r'"content"\s*:\s*"((?:\\.|[^"\\]){1,1024})')
+
+
+def _bound_hint(text: Any, limit: int = 400) -> str | None:
+    """Strip outer whitespace and bound a label hint string to `limit` chars."""
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    return cleaned[:limit]
+
+
+def _read_head_user_prompt(
+    path: Path,
+    *,
+    max_bytes: int = 32_768,
+    max_lines: int = 6,
+    limit: int = 360,
+) -> str | None:
+    """Read a bounded head snippet of the first user prompt in a Claude subagent JSONL."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    cached = _CLAUDE_HEAD_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+
+    result: str | None = None
+    try:
+        with path.open("rb") as fh:
+            raw = fh.read(max_bytes)
+        for line_bytes in raw.splitlines()[:max_lines]:
+            line_str = line_bytes.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                continue
+            try:
+                obj = json.loads(line_str)
+            except ValueError:
+                if '"user"' in line_str[:256]:
+                    m = _TRUNCATED_CONTENT_RE.search(line_str[:2048])
+                    if m:
+                        try:
+                            extracted = json.loads(f'"{m.group(1)}"')
+                        except ValueError:
+                            extracted = m.group(1)
+                        result = _bound_hint(extracted, limit)
+                        if result:
+                            break
+                continue
+            if not isinstance(obj, dict):
+                continue
+            msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+            if obj.get("type") == "user" or msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, str):
+                    result = _bound_hint(content, limit)
+                    if result:
+                        break
+                elif isinstance(content, list):
+                    for part in content:
+                        if (
+                            isinstance(part, dict)
+                            and part.get("type") == "text"
+                            and isinstance(part.get("text"), str)
+                        ):
+                            result = _bound_hint(part["text"], limit)
+                            if result:
+                                break
+                    if result:
+                        break
+    except OSError:
+        return None
+
+    if len(_CLAUDE_HEAD_CACHE) > 512:
+        _CLAUDE_HEAD_CACHE.clear()
+    _CLAUDE_HEAD_CACHE[key] = (st.st_mtime_ns, st.st_size, result)
+    return result
 
 
 def _safe_json_load(path: Path) -> Any:
@@ -238,6 +320,8 @@ def _parse_grok_session(
         "sid": sid,
         "cwd": cwd,
         "title": title,
+        "generated_title": _bound_hint(summary.get("generated_title"), 400),
+        "session_summary": _bound_hint(summary.get("session_summary"), 360),
         "model": model,
         "reasoning_effort": summary.get("reasoning_effort"),
         "created_ts": created_ts,
@@ -347,27 +431,37 @@ def _discover_grok_flows(
                 if slink:
                     links.append(slink)
 
-                agents.append(
-                    make_agent(
-                        s["sid"],
-                        s["title"],
-                        parent=None,
-                        role="worker",
-                        lab="xai",
-                        model=s["model"],
-                        provider="xai",
-                        state=s["state"],
-                        started_at=s_start,
-                        ended_at=s_end,
-                        dur_s=dur_s,
-                        tokens=s["tokens"],
-                        cost_usd=s["cost_usd"],
-                        last=s["last"],
-                        result=s["result"],
-                        links=links,
-                        output_ids=out_ids,
-                    )
+                agent = make_agent(
+                    s["sid"],
+                    s["title"],
+                    parent=None,
+                    role="worker",
+                    lab="xai",
+                    model=s["model"],
+                    provider="xai",
+                    state=s["state"],
+                    started_at=s_start,
+                    ended_at=s_end,
+                    dur_s=dur_s,
+                    tokens=s["tokens"],
+                    cost_usd=s["cost_usd"],
+                    last=s["last"],
+                    result=s["result"],
+                    links=links,
+                    output_ids=out_ids,
                 )
+                raw_title = s["generated_title"] or (
+                    _bound_hint(s["title"], 400)
+                    if s["title"] != s["session_summary"]
+                    else None
+                )
+                agent["_labelHint"] = {
+                    "prompt": s["session_summary"],
+                    "slug": None,
+                    "planTask": None,
+                    "rawTitle": raw_title,
+                }
+                agents.append(agent)
 
             if len(cluster) == 1:
                 flow_title = first["title"]
@@ -525,25 +619,33 @@ def _discover_codex_flows(
 
             s_iso = to_iso_utc(c_ts)
             e_iso = to_iso_utc(u_ts)
-            agents.append(
-                make_agent(
-                    tid,
-                    name,
-                    parent=parent_ref,
-                    role=role,
-                    lab="openai",
-                    model=model,
-                    provider="openai",
-                    state="done",
-                    started_at=s_iso,
-                    ended_at=e_iso,
-                    dur_s=compute_dur_s(s_iso, e_iso, is_running=False, now_ts=now_ts),
-                    tokens=tokens,
-                    cost_usd=cost_usd,
-                    last=_truncate(r.get("preview") or r.get("first_user_message"), 160),
-                    links=links,
-                )
+            agent = make_agent(
+                tid,
+                name,
+                parent=parent_ref,
+                role=role,
+                lab="openai",
+                model=model,
+                provider="openai",
+                state="done",
+                started_at=s_iso,
+                ended_at=e_iso,
+                dur_s=compute_dur_s(s_iso, e_iso, is_running=False, now_ts=now_ts),
+                tokens=tokens,
+                cost_usd=cost_usd,
+                last=_truncate(r.get("preview") or r.get("first_user_message"), 160),
+                links=links,
             )
+            agent["_labelHint"] = {
+                "prompt": _bound_hint(
+                    r.get("first_user_message") or r.get("preview"),
+                    360,
+                ),
+                "slug": _bound_hint(r.get("agent_nickname"), 400),
+                "planTask": None,
+                "rawTitle": _bound_hint(r.get("title") or r.get("name") or name, 400),
+            }
+            agents.append(agent)
 
         flow_title = str(
             (parent_row or members[0]).get("title")
@@ -655,7 +757,9 @@ def _discover_claude_flows(
                     links.append(slink)
 
                 m_tasks = [t for t in team_tasks if t.get("owner") == m_name]
-                last_task = _truncate(m_tasks[-1].get("subject") if m_tasks else None, 160)
+                raw_last_task = m_tasks[-1].get("subject") if m_tasks else None
+                raw_task_desc = m_tasks[-1].get("description") if m_tasks else None
+                last_task = _truncate(raw_last_task, 160)
                 parent_id = (
                     lead_id
                     if (
@@ -667,23 +771,28 @@ def _discover_claude_flows(
                     else None
                 )
 
-                agents.append(
-                    make_agent(
-                        m_id,
-                        m_name,
-                        parent=parent_id,
-                        role=str(m.get("agentType") or "worker"),
-                        lab="anthropic",
-                        model=m_model,
-                        provider="anthropic",
-                        state=normalize_state(m.get("status") or "done"),
-                        started_at=to_iso_utc(joined_ts),
-                        tokens=tokens,
-                        cost_usd=cost_usd,
-                        last=last_task,
-                        links=links,
-                    )
+                agent = make_agent(
+                    m_id,
+                    m_name,
+                    parent=parent_id,
+                    role=str(m.get("agentType") or "worker"),
+                    lab="anthropic",
+                    model=m_model,
+                    provider="anthropic",
+                    state=normalize_state(m.get("status") or "done"),
+                    started_at=to_iso_utc(joined_ts),
+                    tokens=tokens,
+                    cost_usd=cost_usd,
+                    last=last_task,
+                    links=links,
                 )
+                agent["_labelHint"] = {
+                    "prompt": _bound_hint(raw_task_desc, 360),
+                    "slug": _bound_hint(m.get("agentType"), 400),
+                    "planTask": _bound_hint(raw_last_task, 400),
+                    "rawTitle": _bound_hint(m_name, 400),
+                }
+                agents.append(agent)
 
             try:
                 cfg_mtime = cfg_path.stat().st_mtime
@@ -803,26 +912,32 @@ def _discover_claude_flows(
 
                 s_iso = to_iso_utc(first_ts or last_ts)
                 e_iso = to_iso_utc(last_ts)
-                agents.append(
-                    make_agent(
-                        sf.stem,
-                        sf.stem,
-                        parent=parent_key,
-                        role="subagent",
-                        lab="anthropic",
-                        model=model,
-                        provider="anthropic",
-                        state="done",
-                        started_at=s_iso,
-                        ended_at=e_iso,
-                        dur_s=compute_dur_s(s_iso, e_iso, is_running=False, now_ts=now_ts),
-                        tokens=tokens,
-                        cost_usd=cost_usd,
-                        last=_truncate(last_msg, 160),
-                        links=links,
-                        output_ids=[out_id],
-                    )
+                head_prompt = _read_head_user_prompt(sf)
+                agent = make_agent(
+                    sf.stem,
+                    sf.stem,
+                    parent=parent_key,
+                    role="subagent",
+                    lab="anthropic",
+                    model=model,
+                    provider="anthropic",
+                    state="done",
+                    started_at=s_iso,
+                    ended_at=e_iso,
+                    dur_s=compute_dur_s(s_iso, e_iso, is_running=False, now_ts=now_ts),
+                    tokens=tokens,
+                    cost_usd=cost_usd,
+                    last=_truncate(last_msg, 160),
+                    links=links,
+                    output_ids=[out_id],
                 )
+                agent["_labelHint"] = {
+                    "prompt": head_prompt,
+                    "slug": _bound_hint(sf.stem, 400),
+                    "planTask": None,
+                    "rawTitle": _bound_hint(sf.stem, 400),
+                }
+                agents.append(agent)
 
             if agents:
                 sub_count = len(agents)
@@ -840,6 +955,12 @@ def _discover_claude_flows(
                     ended_at=f_end,
                     dur_s=compute_dur_s(f_start, f_end, is_running=False, now_ts=now_ts),
                 )
+                root_agent["_labelHint"] = {
+                    "prompt": None,
+                    "slug": None,
+                    "planTask": None,
+                    "rawTitle": _bound_hint(f"Session {parent_key[:8]}", 400),
+                }
                 flows.append(
                     make_flow(
                         f"claude-subagents:{parent_key}",

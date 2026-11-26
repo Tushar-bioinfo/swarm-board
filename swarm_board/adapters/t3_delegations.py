@@ -9,6 +9,7 @@ import re
 import sqlite3
 import time
 from typing import Any
+import urllib.parse
 
 from swarm_board import safety
 from swarm_board.schema import (
@@ -71,6 +72,36 @@ _REL_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_:/.-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.@+-]+)+\.[A-Za-z0-9]{1,10})(?![A-Za-z0-9_.-])"
 )
 _LINE_SUFFIX_RE = re.compile(r"(?:#L\d+(?:-L?\d+)?|:\d+(?::\d+)?)$")
+_PROMPT_HEAD_CHARS = 360
+_LABEL_HINT_MAX_CHARS = 400
+_PURE_UUID_RE = re.compile(
+    r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})$",
+    re.IGNORECASE,
+)
+_GENERIC_SLUG_TOKENS = frozenset(
+    {"node", "command", "mcp", "delegated-task", "delegate-task"}
+)
+
+
+def _bound_hint(text: Any, limit: int = _LABEL_HINT_MAX_CHARS) -> str | None:
+    """Strip outer whitespace and bound a label hint string to `limit` chars."""
+    if not isinstance(text, str):
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    return cleaned[:limit]
+
+
+def _extract_subagent_slug(subagent_id: str | None) -> str | None:
+    """Extract a clean non-UUID trailing slug from a T3 subagent_id."""
+    if not isinstance(subagent_id, str) or not subagent_id.strip():
+        return None
+    unquoted = urllib.parse.unquote(subagent_id)
+    seg = unquoted.rsplit(":", 1)[-1].strip()
+    if not seg or _PURE_UUID_RE.match(seg) or seg.lower() in _GENERIC_SLUG_TOKENS:
+        return None
+    return seg[:_LABEL_HINT_MAX_CHARS]
 
 
 def _open_ro(db_path: Path) -> sqlite3.Connection:
@@ -696,7 +727,7 @@ def discover_t3_flows(
         return []
 
     try:
-        # 1. Fetch slim subagent rows (NEVER pull $.prompt or full $.result on list scan).
+        # 1. Fetch slim subagent rows (NEVER pull full $.prompt or full $.result on list scan).
         sub_rows = conn.execute(
             """
             SELECT
@@ -718,7 +749,8 @@ def discover_t3_flows(
                 json_extract(payload_json, '$.role') AS role,
                 json_extract(payload_json, '$.model') AS model,
                 json_extract(payload_json, '$.modelSelection.model') AS ms_model,
-                substr(json_extract(payload_json, '$.result'), 1, 400) AS result_snippet
+                substr(json_extract(payload_json, '$.result'), 1, 400) AS result_snippet,
+                substr(json_extract(payload_json, '$.prompt'), 1, 360) AS prompt_head
             FROM orchestration_v2_projection_subagents
             ORDER BY COALESCE(started_at, updated_at) ASC, subagent_id ASC
             """
@@ -1130,6 +1162,15 @@ def discover_t3_flows(
             if i_deduped:
                 i_agent["usageDeduped"] = True
                 i_agent["meta"] = {"usageDeduped": True}
+            i_raw_title = tinfo.get("title") or (
+                itid if not _PURE_UUID_RE.match(str(itid)) else None
+            )
+            i_agent["_labelHint"] = {
+                "prompt": None,
+                "slug": None,
+                "planTask": None,
+                "rawTitle": _bound_hint(i_raw_title, _LABEL_HINT_MAX_CHARS),
+            }
             intermediate_agents.append(i_agent)
 
         # Now assemble every subagent node.
@@ -1275,6 +1316,20 @@ def discover_t3_flows(
             if usage_deduped:
                 sub_agent["usageDeduped"] = True
                 sub_agent["meta"] = {"usageDeduped": True}
+            raw_title = s["title"] or (cinfo.get("title") if cinfo else None)
+            if (
+                not raw_title
+                and isinstance(name, str)
+                and not name.startswith("node:")
+                and not _PURE_UUID_RE.match(name)
+            ):
+                raw_title = name
+            sub_agent["_labelHint"] = {
+                "prompt": _bound_hint(s["prompt_head"], _PROMPT_HEAD_CHARS),
+                "slug": _extract_subagent_slug(s["subagent_id"]),
+                "planTask": None,
+                "rawTitle": _bound_hint(raw_title, _LABEL_HINT_MAX_CHARS),
+            }
             sub_agents.append(sub_agent)
 
         # Assemble root Agent.
@@ -1343,6 +1398,15 @@ def discover_t3_flows(
             output_ids=root_out_ids,
         )
         root_agent["costEstimated"] = root_cost_est
+        root_raw_title = root_info.get("title") or (
+            root_title if not _PURE_UUID_RE.match(str(root_title)) else None
+        )
+        root_agent["_labelHint"] = {
+            "prompt": None,
+            "slug": None,
+            "planTask": None,
+            "rawTitle": _bound_hint(root_raw_title, _LABEL_HINT_MAX_CHARS),
+        }
 
         all_agents = [root_agent] + non_root_agents
         max_depth, leaf_count = _compute_tree_shape(root_tid, all_agents)

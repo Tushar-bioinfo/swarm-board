@@ -15,7 +15,7 @@ function preserveScroll(fn) {
   fn();
   if (l && $('left')) $('left').scrollTop = lt;
   if (s && $('side')) $('side').scrollTop = st;
-  if (!$('app').classList.contains('appm')) scrollTo(0, wy);
+  if (!$('app').classList.contains('appm') || S.page === 'stats') scrollTo(0, wy);
   if (sw && $('swq')) { $('swq').focus(); if (ss != null) try { $('swq').setSelectionRange(ss, se); } catch (e) { /* ignore */ } }
 }
 function mergeOutputs(prev, next) {
@@ -47,9 +47,10 @@ async function fetchJson(url) {
   try { data = await r.json(); } catch (e) { data = null; }
   return { ok: r.ok, status: r.status, data };
 }
+function staleStats() { STATS_CACHE.forEach((v) => { v.ts = 0; }); }
 async function fetchFlows(force = false, isInit = false) {
   try {
-    if (force) { FLOW_CACHE.clear(); STATS_CACHE.clear(); LAST_LABS.clear(); MSG_CACHE.clear(); }
+    if (force) { FLOW_CACHE.clear(); staleStats(); MSG_CACHE.clear(); }
     const r = await fetchJson(force ? '/api/flows?force=1' : '/api/flows');
     if (!r.ok || !r.data) throw new Error((r.data && r.data.error) || ('HTTP ' + r.status));
     const res = r.data, prevId = (flow() && flow().id) || S.flowId;
@@ -164,7 +165,7 @@ function fetchStats(scope, flowId, rng, lab, force = false) {
   const fid = scope === 'flow' ? (flowId || '') : '', rg = scope === 'all' ? (rng || 'all') : 'all', lb = lab || '';
   const key = `${scope}|${fid}|${rg}|${lb}`, c = !force && STATS_CACHE.get(key);
   if (c && Date.now() - c.ts < 15000) return Promise.resolve(c.data);
-  if (lb && !LAST_LABS.has(`${scope}|${fid}|${rg}`)) fetchStats(scope, fid, rg, '', false);
+  if (lb) { const u = STATS_CACHE.get(`${scope}|${fid}|${rg}|`); if (!u || Date.now() - u.ts >= 15000) fetchStats(scope, fid, rg, '', false); }
   return once('st:' + key, async () => {
     try {
       const r = await fetchJson(`/api/stats?scope=${EU(scope)}&flow_id=${EU(fid)}&rng=${EU(rg)}&lab=${EU(lb)}`);
@@ -177,7 +178,7 @@ function fetchStats(scope, flowId, rng, lab, force = false) {
     finally {
       if (S.page === 'stats') {
         const curFid = S.scope === 'flow' ? ((flow() && flow().id) || '') : '', curRg = S.scope === 'all' ? (S.rng || 'all') : 'all';
-        if (S.scope === scope && curFid === fid && curRg === rg && (S.lab || '') === lb) renderStats();
+        if (S.scope === scope && curFid === fid && curRg === rg && (S.lab || '') === lb) preserveScroll(() => renderStats());
       }
     }
   });
@@ -192,7 +193,7 @@ function connectSSE() {
   es.addEventListener('update', () => {
     setConn('live');
     clearTimeout(SSE_TMR);
-    SSE_TMR = setTimeout(() => { STATS_CACHE.clear(); LAST_LABS.clear(); MSG_CACHE.clear(); fetchFlows(false, false); }, 200);
+    SSE_TMR = setTimeout(() => { staleStats(); MSG_CACHE.clear(); fetchFlows(false, false); }, 200);
   });
   es.onerror = () => setConn(es.readyState === 2 ? 'offline' : 'reconnecting');
 }

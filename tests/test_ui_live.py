@@ -105,6 +105,13 @@ class UiLiveTests(unittest.TestCase):
         for marker in REQUIRED_MARKERS:
             self.assertIn(marker, self.html, f"Missing expected UI marker: {marker}")
 
+    def test_css_descendant_pseudo_selectors_preserved(self) -> None:
+        self.assertIn(".app.stp.stp :is(.fhead,.cols,.filt>.lfold){display:none}", self.html)
+        self.assertNotIn(".app.stp.stp:is(", self.html)
+        self.assertNotIn(".md:is(", self.html)
+        self.assertNotIn(".mapw:is(", self.html)
+        self.assertNotIn("STATS_CACHE.clear()", self.html)
+
     def test_inline_script_passes_node_syntax_check(self) -> None:
         node_bin = shutil.which("node")
         if not node_bin:

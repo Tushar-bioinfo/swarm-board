@@ -21,6 +21,21 @@ from .harness_runs import (
     discover_harness_runs,
 )
 
+try:
+    from ..labeler import (
+        BackgroundLabeler,
+        LabelCache,
+        enrich_flow_labels,
+        load_labeler_config,
+    )
+except ModuleNotFoundError as _exc:
+    if _exc.name not in ("swarm_board.labeler", "labeler"):
+        raise
+    BackgroundLabeler = None  # type: ignore[assignment]
+    LabelCache = None  # type: ignore[assignment]
+    enrich_flow_labels = None  # type: ignore[assignment]
+    load_labeler_config = None  # type: ignore[assignment]
+
 _MAX_INLINE_OUTPUT_BYTES_IN_LIST = 16_384
 _STATS_LABS = ("google", "anthropic", "openai", "xai", "t3", "other")
 _STATE_TO_BUCKET = {
@@ -44,6 +59,14 @@ _HARNESS_PRIORITY = {
     "delegate": 8,
 }
 _NICE_STEPS = (60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600)
+_TEST_ISOLATION_KEYS = (
+    "statev2_db",
+    "rates_path",
+    "usage_cache_path",
+    "dropin_dir",
+    "committee_dir",
+    "orchestrate_dir",
+)
 
 
 def _as_path_list(val: Any) -> list[Path] | None:
@@ -269,17 +292,76 @@ class BoardRegistry:
         self.rate_table = RateTable(self.config.get("rates_path"))
         self.usage_index = UsageIndex(self.config.get("usage_cache_path"))
 
+        label_override: dict[str, Any] = {}
+        for k in ("labeler", "labeler_config"):
+            if isinstance(self.config.get(k), dict):
+                label_override.update(self.config[k])
+        if "labeler_enabled" in self.config:
+            label_override["enabled"] = bool(self.config["labeler_enabled"])
+        elif "enabled" not in label_override and any(
+            k in self.config for k in _TEST_ISOLATION_KEYS
+        ):
+            label_override["enabled"] = False
+
+        label_cache_raw = self.config.get("label_cache_path")
+        if label_cache_raw:
+            label_cache_path: Path | None = Path(label_cache_raw)
+        elif self.config.get("state_dir"):
+            label_cache_path = Path(self.config["state_dir"]) / "labels-cache.json"
+        else:
+            label_cache_path = None
+
+        self._label_config: dict[str, Any] | None
+        self._label_cache: Any | None
+        self._bg_labeler: Any | None
+        if (
+            load_labeler_config is not None
+            and LabelCache is not None
+            and BackgroundLabeler is not None
+        ):
+            self._label_config = load_labeler_config(label_override or None)
+            if label_override.get("enabled") is False and isinstance(self._label_config, dict):
+                self._label_config["enabled"] = False
+            self._label_cache = LabelCache(label_cache_path)
+            self._bg_labeler = BackgroundLabeler(
+                config=self._label_config,
+                cache=self._label_cache,
+            )
+        else:
+            self._label_config = None
+            self._label_cache = None
+            self._bg_labeler = None
+
         self._lock = threading.RLock()
         self._cached_at: float = 0.0
         self._has_snapshot: bool = False
         self._cached_flows: list[dict[str, Any]] = []
         self._flow_by_id: dict[str, dict[str, Any]] = {}
+        self._cached_label_sig: tuple[int, float] = self._label_state_sig()
         self.last_errors: dict[str, str] = {}
+
+    def _label_state_sig(self) -> tuple[int, float]:
+        ver = int(self._bg_labeler.version()) if self._bg_labeler is not None else 0
+        mtime = float(self._label_cache.mtime()) if self._label_cache is not None else 0.0
+        return (ver, mtime)
+
+    def close(self) -> None:
+        """Stop background workers owned by this registry."""
+        bg = getattr(self, "_bg_labeler", None)
+        if bg is not None:
+            try:
+                bg.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _import_optional_adapter(self, module_name: str) -> Any | None:
         return importlib.import_module(f".{module_name}", package=__package__)
 
-    def _collect_all_flows_unlocked(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    def _collect_all_flows_unlocked(
+        self,
+        *,
+        enrich_labels: bool = True,
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
         errors: dict[str, str] = {}
         collected: list[dict[str, Any]] = []
         cfg = self.config
@@ -375,14 +457,53 @@ class BoardRegistry:
                     by_id[fid] = flow
 
         sorted_flows = sorted(by_id.values(), key=_flow_sort_key)
-        return sorted_flows, errors
+        enriched_flows: list[dict[str, Any]] = []
+        for flow in sorted_flows:
+            f_copy = dict(flow)
+            raw_agents = flow.get("agents")
+            if isinstance(raw_agents, list):
+                f_copy["agents"] = [
+                    dict(a) if isinstance(a, dict) else a for a in raw_agents
+                ]
+            raw_outputs = flow.get("outputs")
+            if isinstance(raw_outputs, list):
+                f_copy["outputs"] = [
+                    dict(o) if isinstance(o, dict) else o for o in raw_outputs
+                ]
+
+            if enrich_labels and enrich_flow_labels is not None:
+                try:
+                    f_copy = enrich_flow_labels(
+                        f_copy,
+                        cache=self._label_cache,
+                        background=self._bg_labeler,
+                        config=self._label_config,
+                    )
+                except Exception as exc:  # noqa: BLE001 - isolate labeler failures
+                    errors.setdefault("labeler", f"{type(exc).__name__}: {exc}")
+
+            if enrich_labels:
+                for agent in f_copy.get("agents") or ():
+                    if isinstance(agent, dict):
+                        agent.pop("_labelHint", None)
+            enriched_flows.append(f_copy)
+
+        return enriched_flows, errors
+
+    def list_raw_flows(self) -> list[dict[str, Any]]:
+        """Return shallow-copied discovered flows with `_labelHint` intact (for CLI batch labeling)."""
+        with self._lock:
+            flows, _ = self._collect_all_flows_unlocked(enrich_labels=False)
+            return flows
 
     def _ensure_fresh_unlocked(self, force: bool = False) -> None:
         now_mono = time.monotonic()
+        cur_label_sig = self._label_state_sig()
         if (
             not force
             and self._has_snapshot
             and (now_mono - self._cached_at) < self.cache_ttl_s
+            and cur_label_sig == self._cached_label_sig
         ):
             return
         flows, errors = self._collect_all_flows_unlocked()
@@ -390,6 +511,7 @@ class BoardRegistry:
         self._flow_by_id = {str(f["id"]): f for f in flows if isinstance(f, dict) and f.get("id")}
         self.last_errors = errors
         self._cached_at = time.monotonic()
+        self._cached_label_sig = self._label_state_sig()
         self._has_snapshot = True
 
     def _compact_flow(self, flow: dict[str, Any]) -> dict[str, Any]:
@@ -751,7 +873,7 @@ class BoardRegistry:
                     disp_name = (
                         "root"
                         if a.get("role") == "root"
-                        else str(a.get("name") or a_id.split("%3A")[-1][-24:])
+                        else str(a.get("label") or a.get("name") or a_id.split("%3A")[-1][-24:])
                     )[:48]
                     top_agents.append(
                         [
@@ -1068,22 +1190,34 @@ class BoardRegistry:
         """Fast deterministic hash of flow/agent states and post/output counts for SSE diffing."""
         with self._lock:
             self._ensure_fresh_unlocked(force=False)
-            summary = [
-                {
-                    "id": f.get("id"),
-                    "u": f.get("updatedAt"),
-                    "p": len(f.get("posts") or ()),
-                    "o": len(f.get("outputs") or ()),
-                    "d": f.get("decision"),
-                    "a": [
-                        (a.get("id"), a.get("state"), a.get("verdict"), a.get("last"))
-                        for a in (f.get("agents") or ())
-                        if isinstance(a, dict)
-                    ],
-                }
-                for f in self._cached_flows
-                if isinstance(f, dict)
-            ]
+            lv, lm = self._label_state_sig()
+            summary = {
+                "lv": lv,
+                "lm": lm,
+                "flows": [
+                    {
+                        "id": f.get("id"),
+                        "u": f.get("updatedAt"),
+                        "p": len(f.get("posts") or ()),
+                        "o": len(f.get("outputs") or ()),
+                        "d": f.get("decision"),
+                        "a": [
+                            (
+                                a.get("id"),
+                                a.get("state"),
+                                a.get("verdict"),
+                                a.get("last"),
+                                a.get("label"),
+                                a.get("task"),
+                            )
+                            for a in (f.get("agents") or ())
+                            if isinstance(a, dict)
+                        ],
+                    }
+                    for f in self._cached_flows
+                    if isinstance(f, dict)
+                ],
+            }
         payload = json.dumps(summary, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:16]
 

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 from datetime import datetime, timezone
 import errno
 import fcntl
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 from pathlib import Path
@@ -17,6 +20,7 @@ import queue
 import re
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -29,22 +33,26 @@ from .safety import is_path_allowed, redact_if_secret_name
 
 SERVER_VERSION = "0.3.0"
 BIND_HOST = "127.0.0.1"
+TAILSCALE_CGNAT_NET = ipaddress.IPv4Network("100.64.0.0/10")
 DEFAULT_PORT = 18420
 PORT_SCAN_END = 18449
-DEFAULT_IDLE_SECONDS = 900.0
+DEFAULT_IDLE_SECONDS = 7200.0
 DEFAULT_SSE_POLL_S = 2.0
 DEFAULT_SSE_HEARTBEAT_S = 20.0
 _STREAM_CHUNK_BYTES = 65_536
 _ENSURE_TIMEOUT_S = 5.0
 _HEALTH_PROBE_TIMEOUT_S = 0.4
 _HOOK_PROBE_TIMEOUT_S = 0.25
+_SIOCGIFADDR = 0x8915
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_UI_DIR = Path(__file__).resolve().parent / "ui"
 _DEFAULT_ENV_ID_PATH = Path.home() / ".t3" / "userdata" / "environment-id"
+_DEFAULT_CONFIG_PATH = Path.home() / ".config" / "swarm-board" / "config.json"
 
 _HOST_HEADER_RE = re.compile(r"^(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d{1,5}))?$")
 _BYTE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+_IP_INET_RE = re.compile(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/")
 
 _LOGGER = logging.getLogger("swarm_board.server")
 
@@ -77,22 +85,282 @@ def get_state_dir(override: str | Path | None = None) -> Path:
     return base / "swarm-board"
 
 
-def is_valid_host_header(host: str | None) -> bool:
-    """Allow only loopback Host headers (127.0.0.1, localhost, [::1]) to prevent DNS rebinding."""
+def get_config_path(override: str | Path | None = None) -> Path | None:
+    """Resolve user config path, or None when SWARM_BOARD_CONFIG disables lookup."""
+    if override is not None:
+        raw = str(override).strip()
+        return Path(raw).expanduser() if raw else None
+    if "SWARM_BOARD_CONFIG" in os.environ:
+        env_cfg = os.environ["SWARM_BOARD_CONFIG"].strip()
+        return Path(env_cfg).expanduser() if env_cfg else None
+    return _DEFAULT_CONFIG_PATH
+
+
+def load_user_config(config_path: str | Path | None = None) -> dict[str, Any]:
+    """Load optional JSON config (returns {} if absent, disabled, or invalid)."""
+    path = get_config_path(config_path)
+    if path is None:
+        return {}
+    data = _read_json_file(path)
+    return data if data is not None else {}
+
+
+def is_tailscale_ipv4(host: str) -> bool:
+    """Return True when host is a Tailscale CGNAT IPv4 address (100.64.0.0/10)."""
+    try:
+        ip = ipaddress.IPv4Address((host or "").strip())
+    except ValueError:
+        return False
+    return ip in TAILSCALE_CGNAT_NET
+
+
+def is_loopback_host(host: str) -> bool:
+    """Return True when host refers to loopback (127.0.0.0/8, localhost, or ::1)."""
+    cleaned = (host or "").strip().lower()
+    if cleaned in ("localhost", "::1", "[::1]"):
+        return True
+    try:
+        ip = ipaddress.IPv4Address(cleaned)
+    except ValueError:
+        return False
+    return ip.is_loopback
+
+
+def detect_tailscale_ipv4() -> str:
+    """Detect the local Tailscale IPv4 address without ever falling back to 0.0.0.0."""
+    if sys.platform.startswith("linux"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                ifreq = fcntl.ioctl(
+                    sock.fileno(),
+                    _SIOCGIFADDR,
+                    struct.pack("256s", b"tailscale0"),
+                )
+                ip_str = socket.inet_ntoa(ifreq[20:24])
+                if is_tailscale_ipv4(ip_str):
+                    return ip_str
+        except OSError:
+            pass
+
+    try:
+        proc = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                cand = line.strip()
+                if is_tailscale_ipv4(cand):
+                    return cand
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    if sys.platform.startswith("linux"):
+        try:
+            proc_ip = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if proc_ip.returncode == 0:
+                for match in _IP_INET_RE.finditer(proc_ip.stdout):
+                    cand = match.group(1)
+                    if is_tailscale_ipv4(cand):
+                        return cand
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    raise RuntimeError(
+        "Tailscale IPv4 address (100.64.0.0/10) not found; refusing to bind non-Tailscale interface."
+    )
+
+
+def detect_tailscale_hostnames() -> list[str]:
+    """Return normalized local Tailscale MagicDNS / HostName entries (best-effort)."""
+    try:
+        proc = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return []
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+    self_info = data.get("Self") if isinstance(data, dict) else None
+    if not isinstance(self_info, dict):
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for key in ("DNSName", "HostName"):
+        raw = self_info.get(key)
+        if isinstance(raw, str):
+            norm = raw.strip().lower().rstrip(".")
+            if norm and norm not in seen:
+                seen.add(norm)
+                out.append(norm)
+    return out
+
+
+def resolve_bind_host(
+    host: str | None = None,
+    *,
+    use_env_and_config: bool = True,
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Resolve and strictly validate a loopback or Tailscale-only bind host."""
+    raw: str
+    if host is not None:
+        raw = str(host).strip()
+    elif use_env_and_config:
+        env_host = os.environ.get("SWARM_BOARD_HOST", "").strip()
+        if env_host:
+            raw = env_host
+        else:
+            cfg = config if config is not None else load_user_config()
+            cfg_host = cfg.get("host")
+            raw = cfg_host.strip() if isinstance(cfg_host, str) and cfg_host.strip() else BIND_HOST
+    else:
+        raw = BIND_HOST
+
+    low = raw.lower()
+    if low in ("", "127.0.0.1", "localhost", "loopback"):
+        return BIND_HOST
+    if low == "tailscale":
+        return detect_tailscale_ipv4()
+
+    try:
+        ip = ipaddress.IPv4Address(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Unsupported bind host {raw!r}; expected '127.0.0.1', 'tailscale', or a loopback/100.64.0.0/10 IPv4."
+        ) from exc
+
+    if ip.is_loopback or ip in TAILSCALE_CGNAT_NET:
+        return str(ip)
+    raise ValueError(
+        f"Refusing to bind non-loopback, non-Tailscale IPv4 address: {raw}"
+    )
+
+
+def resolve_open_in_preview(
+    bind_host: str,
+    *,
+    config: dict[str, Any] | None = None,
+) -> bool:
+    """Determine whether agents should open Swarm Board in T3 preview or return the URL."""
+    env_raw = os.environ.get("SWARM_BOARD_OPEN_IN_PREVIEW", "").strip().lower()
+    if env_raw in ("1", "true", "yes"):
+        return True
+    if env_raw in ("0", "false", "no"):
+        return False
+
+    cfg = config if config is not None else load_user_config()
+    cfg_val = cfg.get("open_in_preview")
+    if isinstance(cfg_val, bool):
+        return cfg_val
+    return is_loopback_host(bind_host)
+
+
+def _parse_idle_seconds(raw: Any) -> float | None:
+    """Parse a finite non-negative idle timeout in seconds, rejecting booleans."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+    elif isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned:
+            return None
+        try:
+            val = float(cleaned)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(val):
+        return None
+    return max(0.0, val)
+
+
+def resolve_idle_seconds(
+    idle_seconds: float | None = None,
+    *,
+    use_env_and_config: bool = True,
+    config: dict[str, Any] | None = None,
+) -> float:
+    """Resolve idle auto-exit timeout in seconds (explicit > env > config > default)."""
+    if idle_seconds is not None:
+        parsed = _parse_idle_seconds(idle_seconds)
+        if parsed is None:
+            raise ValueError(f"Invalid idle_seconds value: {idle_seconds!r}")
+        return parsed
+
+    if use_env_and_config:
+        env_raw = os.environ.get("SWARM_BOARD_IDLE_SECONDS", "").strip()
+        if env_raw:
+            parsed = _parse_idle_seconds(env_raw)
+            if parsed is not None:
+                return parsed
+
+        cfg = config if config is not None else load_user_config()
+        if "idle_seconds" in cfg and cfg["idle_seconds"] is not None:
+            parsed = _parse_idle_seconds(cfg["idle_seconds"])
+            if parsed is not None:
+                return parsed
+
+    return DEFAULT_IDLE_SECONDS
+
+
+def is_valid_host_header(
+    host: str | None,
+    *,
+    allowed_hosts: Iterable[str] | None = None,
+) -> bool:
+    """Allow loopback Host headers plus explicit bound Tailscale IPs/MagicDNS hostnames."""
     if host is None:
         return True
     cleaned = host.strip().lower()
     if not cleaned:
         return False
     m = _HOST_HEADER_RE.match(cleaned)
-    if not m:
+    if m:
+        port_str = m.group(1)
+        if port_str is not None:
+            port_num = int(port_str)
+            if port_num < 1 or port_num > 65535:
+                return False
+        return True
+
+    if allowed_hosts is None:
         return False
-    port_str = m.group(1)
-    if port_str is not None:
+
+    allowed_set = {str(h).strip().lower().rstrip(".") for h in allowed_hosts if str(h).strip()}
+    if not allowed_set or cleaned.startswith("["):
+        return False
+
+    if ":" in cleaned:
+        host_part, port_str = cleaned.rsplit(":", 1)
+        if ":" in host_part or not port_str.isdigit():
+            return False
         port_num = int(port_str)
         if port_num < 1 or port_num > 65535:
             return False
-    return True
+    else:
+        host_part = cleaned
+
+    norm_host = host_part.rstrip(".")
+    return bool(norm_host) and norm_host in allowed_set
 
 
 def parse_byte_range(header: str, total_size: int) -> tuple[int, int]:
@@ -540,7 +808,10 @@ class SwarmBoardRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _check_host(self) -> bool:
-        if not is_valid_host_header(self.headers.get("Host")):
+        if not is_valid_host_header(
+            self.headers.get("Host"),
+            allowed_hosts=self.server.allowed_hosts,
+        ):
             self._send_json(403, {"ok": False, "error": "Forbidden host"})
             return False
         return True
@@ -658,11 +929,20 @@ class SwarmBoardRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _serve_health(self, *, head_only: bool) -> None:
+        hosts = (
+            [self.server.bind_host, BIND_HOST]
+            if self.server.bind_host != BIND_HOST
+            else [self.server.bind_host]
+        )
         payload = {
             "ok": True,
             "pid": os.getpid(),
+            "host": self.server.bind_host,
+            "hosts": hosts,
             "port": self.server.bound_port,
+            "local_url": f"http://{BIND_HOST}:{self.server.bound_port}",
             "uptime_s": round(max(0.0, time.monotonic() - self.server.started_monotonic), 3),
+            "idle_seconds": self.server.idle_seconds,
             "clients": self.server.sse_hub.client_count(),
             "flows_count": self.server.get_flows_count(),
             "version": SERVER_VERSION,
@@ -938,8 +1218,46 @@ class SwarmBoardRequestHandler(BaseHTTPRequestHandler):
             self.server.sse_hub.unregister(client_q)
 
 
+class _LoopbackCompanionServer(ThreadingHTTPServer):
+    """Secondary 127.0.0.1 listener sharing registry, SSE hub, and idle state with primary."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        primary: SwarmBoardHTTPServer,
+    ) -> None:
+        self._primary = primary
+        self._serving_started = threading.Event()
+        self.registry = primary.registry
+        self.ui_dir = primary.ui_dir
+        self.idle_seconds = primary.idle_seconds
+        self.sse_heartbeat_interval_s = primary.sse_heartbeat_interval_s
+        self.started_monotonic = primary.started_monotonic
+        self.sse_hub = primary.sse_hub
+        self.allowed_hosts = primary.allowed_hosts
+        self.bind_host = primary.bind_host
+        self.bound_port = primary.bound_port
+        super().__init__(server_address, SwarmBoardRequestHandler)
+
+    def touch_activity(self) -> None:
+        self._primary.touch_activity()
+
+    def is_shutting_down(self) -> bool:
+        return self._primary.is_shutting_down()
+
+    def get_flows_count(self) -> int:
+        return self._primary.get_flows_count()
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        self._serving_started.set()
+        super().serve_forever(poll_interval=poll_interval)
+
+
 class SwarmBoardHTTPServer(ThreadingHTTPServer):
-    """Multi-threaded loopback HTTP server with SSE hub and idle auto-exit watchdog."""
+    """Multi-threaded loopback/Tailscale HTTP server with SSE hub and idle auto-exit watchdog."""
 
     daemon_threads = True
     allow_reuse_address = True
@@ -953,6 +1271,7 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
         idle_seconds: float = DEFAULT_IDLE_SECONDS,
         sse_poll_interval_s: float = DEFAULT_SSE_POLL_S,
         sse_heartbeat_interval_s: float = DEFAULT_SSE_HEARTBEAT_S,
+        allowed_hosts: Iterable[str] | None = None,
     ) -> None:
         self.registry = registry
         self.ui_dir = Path(ui_dir) if ui_dir is not None else DEFAULT_UI_DIR
@@ -963,6 +1282,27 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
         self._last_activity = self.started_monotonic
         self._shutdown_event = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
+        self._companion: _LoopbackCompanionServer | None = None
+        self._companion_thread: threading.Thread | None = None
+
+        bind_ip = str(server_address[0]).strip() or BIND_HOST
+        hosts: set[str] = {bind_ip.lower()}
+        if allowed_hosts is not None:
+            for item in allowed_hosts:
+                cleaned = str(item).strip().lower().rstrip(".")
+                if cleaned:
+                    hosts.add(cleaned)
+        elif is_tailscale_ipv4(bind_ip):
+            for name in detect_tailscale_hostnames():
+                cleaned = str(name).strip().lower().rstrip(".")
+                if cleaned:
+                    hosts.add(cleaned)
+            cfg_hosts = load_user_config().get("allowed_hosts")
+            if isinstance(cfg_hosts, (list, tuple, set)):
+                for item in cfg_hosts:
+                    if isinstance(item, str) and item.strip():
+                        hosts.add(item.strip().lower().rstrip("."))
+        self.allowed_hosts: frozenset[str] = frozenset(hosts)
 
         self.sse_hub = SSEHub(
             registry,
@@ -970,6 +1310,7 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
             on_empty_callback=self.touch_activity,
         )
         super().__init__(server_address, SwarmBoardRequestHandler)
+        self.bind_host = str(self.server_address[0])
         self.bound_port = int(self.server_address[1])
 
         if self.idle_seconds > 0:
@@ -979,6 +1320,35 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
                 daemon=True,
             )
             self._watchdog_thread.start()
+
+    def attach_loopback_companion(self, companion: _LoopbackCompanionServer) -> None:
+        """Attach a 127.0.0.1 companion listener to share serve/shutdown lifecycle."""
+        self._companion = companion
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        if self._companion is not None:
+            comp = self._companion
+            thread = threading.Thread(
+                target=comp.serve_forever,
+                kwargs={"poll_interval": poll_interval},
+                name="swarm-board-loopback-companion",
+                daemon=True,
+            )
+            self._companion_thread = thread
+            thread.start()
+            comp._serving_started.wait(timeout=1.0)
+        try:
+            super().serve_forever(poll_interval=poll_interval)
+        finally:
+            if self._companion is not None:
+                if self._companion._serving_started.is_set():
+                    self._companion.shutdown()
+                if (
+                    self._companion_thread is not None
+                    and self._companion_thread.is_alive()
+                    and self._companion_thread is not threading.current_thread()
+                ):
+                    self._companion_thread.join(timeout=2.0)
 
     def touch_activity(self) -> None:
         """Record activity timestamp for idle auto-exit tracking."""
@@ -1039,19 +1409,27 @@ class SwarmBoardHTTPServer(ThreadingHTTPServer):
             and self._watchdog_thread is not threading.current_thread()
         ):
             self._watchdog_thread.join(timeout=1.0)
+        if self._companion is not None:
+            try:
+                self._companion.server_close()
+            except OSError:
+                pass
         super().server_close()
 
 
 def _bind_server_socket(
     port: int | None,
     *,
+    host: str | None = None,
     registry: Any,
     ui_dir: Path | None = None,
     idle_seconds: float = DEFAULT_IDLE_SECONDS,
     sse_poll_interval_s: float = DEFAULT_SSE_POLL_S,
     sse_heartbeat_interval_s: float = DEFAULT_SSE_HEARTBEAT_S,
+    allowed_hosts: Iterable[str] | None = None,
 ) -> SwarmBoardHTTPServer:
-    """Create and bind SwarmBoardHTTPServer strictly on 127.0.0.1."""
+    """Create and bind SwarmBoardHTTPServer strictly on loopback or Tailscale+loopback."""
+    bind_host = resolve_bind_host(host, use_env_and_config=False)
     if port is not None:
         candidate_ports = [int(port)]
     else:
@@ -1063,42 +1441,78 @@ def _bind_server_socket(
 
     last_err: OSError | None = None
     for candidate in candidate_ports:
+        if candidate == 0 and bind_host != BIND_HOST:
+            for attempt in range(10):
+                primary = SwarmBoardHTTPServer(
+                    (bind_host, 0),
+                    registry,
+                    ui_dir=ui_dir,
+                    idle_seconds=idle_seconds,
+                    sse_poll_interval_s=sse_poll_interval_s,
+                    sse_heartbeat_interval_s=sse_heartbeat_interval_s,
+                    allowed_hosts=allowed_hosts,
+                )
+                try:
+                    companion = _LoopbackCompanionServer((BIND_HOST, primary.bound_port), primary)
+                except OSError as exc:
+                    last_err = exc
+                    primary.server_close()
+                    if exc.errno == errno.EADDRINUSE and attempt < 9:
+                        continue
+                    raise
+                primary.attach_loopback_companion(companion)
+                return primary
+            continue
+
+        primary: SwarmBoardHTTPServer | None = None
         try:
-            return SwarmBoardHTTPServer(
-                (BIND_HOST, candidate),
+            primary = SwarmBoardHTTPServer(
+                (bind_host, candidate),
                 registry,
                 ui_dir=ui_dir,
                 idle_seconds=idle_seconds,
                 sse_poll_interval_s=sse_poll_interval_s,
                 sse_heartbeat_interval_s=sse_heartbeat_interval_s,
+                allowed_hosts=allowed_hosts,
             )
+            if bind_host != BIND_HOST:
+                companion = _LoopbackCompanionServer((BIND_HOST, primary.bound_port), primary)
+                primary.attach_loopback_companion(companion)
+            return primary
         except OSError as exc:
+            if primary is not None:
+                primary.server_close()
             last_err = exc
             if len(candidate_ports) == 1 or exc.errno not in (errno.EADDRINUSE, errno.EACCES):
                 raise
     raise RuntimeError(
-        f"No available port in {candidate_ports[0]}..{candidate_ports[-1]} on {BIND_HOST}: {last_err}"
+        f"No available port in {candidate_ports[0]}..{candidate_ports[-1]} on {bind_host}: {last_err}"
     )
 
 
 def create_server(
     registry: Any | None = None,
     *,
+    host: str | None = None,
     port: int | None = None,
     ui_dir: Path | None = None,
     idle_seconds: float = DEFAULT_IDLE_SECONDS,
     sse_poll_interval_s: float = DEFAULT_SSE_POLL_S,
     sse_heartbeat_interval_s: float = DEFAULT_SSE_HEARTBEAT_S,
+    allowed_hosts: Iterable[str] | None = None,
 ) -> SwarmBoardHTTPServer:
-    """Build a ready-to-serve SwarmBoardHTTPServer instance bound to 127.0.0.1."""
+    """Build a ready-to-serve SwarmBoardHTTPServer instance bound to loopback or Tailscale."""
     reg = registry if registry is not None else BoardRegistry()
+    bind_host = resolve_bind_host(host, use_env_and_config=False)
     return _bind_server_socket(
         port,
+        host=bind_host,
         registry=reg,
         ui_dir=ui_dir,
         idle_seconds=idle_seconds,
         sse_poll_interval_s=sse_poll_interval_s,
         sse_heartbeat_interval_s=sse_heartbeat_interval_s,
+        allowed_hosts=allowed_hosts,
     )
 
 
@@ -1140,14 +1554,20 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
-def _probe_health(port: int, timeout: float = _HEALTH_PROBE_TIMEOUT_S) -> dict[str, Any] | None:
-    """Probe http://127.0.0.1:<port>/health without honoring external proxy env vars."""
+def _probe_health(
+    port: int,
+    *,
+    host: str = BIND_HOST,
+    timeout: float = _HEALTH_PROBE_TIMEOUT_S,
+) -> dict[str, Any] | None:
+    """Probe http://<host>:<port>/health without honoring external proxy env vars."""
     if port <= 0 or port > 65535:
         return None
+    target_host = (host or BIND_HOST).strip() or BIND_HOST
     conn: http.client.HTTPConnection | None = None
     try:
-        conn = http.client.HTTPConnection(BIND_HOST, int(port), timeout=timeout)
-        conn.request("GET", "/health", headers={"Host": f"{BIND_HOST}:{int(port)}"})
+        conn = http.client.HTTPConnection(target_host, int(port), timeout=timeout)
+        conn.request("GET", "/health", headers={"Host": f"{target_host}:{int(port)}"})
         resp = conn.getresponse()
         raw = resp.read(16_384)
         if resp.status != 200:
@@ -1169,6 +1589,7 @@ def _probe_health(port: int, timeout: float = _HEALTH_PROBE_TIMEOUT_S) -> dict[s
 def _spawn_detached_server(
     state_dir: Path,
     *,
+    host: str = BIND_HOST,
     port: int | None,
     idle_seconds: float,
     explicit_state_dir: Path | None,
@@ -1176,7 +1597,7 @@ def _spawn_detached_server(
 ) -> subprocess.Popen[bytes]:
     state_dir.mkdir(parents=True, exist_ok=True)
     log_path = state_dir / "server.log"
-    cmd = [sys.executable, "-m", "swarm_board.server"]
+    cmd = [sys.executable, "-m", "swarm_board.server", "--host", host]
     if port is not None:
         cmd.extend(["--port", str(port)])
     cmd.extend(["--idle-seconds", str(idle_seconds)])
@@ -1205,42 +1626,94 @@ def _spawn_detached_server(
         )
 
 
+def _state_entry_host(data: dict[str, Any]) -> str:
+    raw = data.get("host")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return BIND_HOST
+
+
 def _try_reuse_existing(
     state_file: Path,
     *,
+    requested_host: str = BIND_HOST,
     requested_port: int | None,
     timeout: float,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Check server.json (and explicit port if > 0) for a live healthy server."""
+    """Check server.json (and explicit port if > 0) for a live healthy server on requested_host."""
     data = _read_json_file(state_file)
     if data is not None:
         entry_port = data.get("port")
-        if isinstance(entry_port, int) and (
-            requested_port is None or requested_port <= 0 or entry_port == requested_port
+        entry_host = _state_entry_host(data)
+        if (
+            isinstance(entry_port, int)
+            and entry_host == requested_host
+            and (requested_port is None or requested_port <= 0 or entry_port == requested_port)
         ):
-            health = _probe_health(entry_port, timeout=timeout)
+            health = _probe_health(entry_port, host=entry_host, timeout=timeout)
             if health is not None:
                 port = int(health["port"])
+                resp_host = str(health.get("host") or entry_host)
                 return {
                     "ok": True,
+                    "host": resp_host,
                     "port": port,
-                    "url": f"http://{BIND_HOST}:{port}",
+                    "url": f"http://{resp_host}:{port}",
+                    "local_url": f"http://{BIND_HOST}:{port}",
                     "pid": int(health["pid"]),
                     "started": False,
+                    "open_in_preview": resolve_open_in_preview(resp_host, config=config),
                 }
 
     if requested_port is not None and requested_port > 0:
-        health = _probe_health(requested_port, timeout=timeout)
+        health = _probe_health(requested_port, host=requested_host, timeout=timeout)
         if health is not None:
             port = int(health["port"])
+            resp_host = str(health.get("host") or requested_host)
             return {
                 "ok": True,
+                "host": resp_host,
                 "port": port,
-                "url": f"http://{BIND_HOST}:{port}",
+                "url": f"http://{resp_host}:{port}",
+                "local_url": f"http://{BIND_HOST}:{port}",
                 "pid": int(health["pid"]),
                 "started": False,
+                "open_in_preview": resolve_open_in_preview(resp_host, config=config),
             }
     return None
+
+
+def _stop_mismatched_host_if_verified(state_file: Path, target_host: str, wait_s: float) -> None:
+    """Stop an existing verified Swarm Board server if it is bound to a different host."""
+    data = _read_json_file(state_file)
+    if data is None:
+        return
+    entry_port = data.get("port")
+    entry_pid = data.get("pid")
+    entry_host = _state_entry_host(data)
+    if (
+        not isinstance(entry_port, int)
+        or not isinstance(entry_pid, int)
+        or entry_host == target_host
+    ):
+        return
+
+    health = _probe_health(entry_port, host=entry_host, timeout=_HOOK_PROBE_TIMEOUT_S)
+    if health is None or int(health.get("pid", -1)) != entry_pid:
+        return
+
+    try:
+        os.kill(entry_pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    while _is_pid_alive(entry_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    if not _is_pid_alive(entry_pid):
+        _remove_server_json_if_owner(state_file, entry_pid)
 
 
 def _active_starting_pid(starting_file: Path, max_age_s: float = _ENSURE_TIMEOUT_S) -> int | None:
@@ -1261,12 +1734,17 @@ def _active_starting_pid(starting_file: Path, max_age_s: float = _ENSURE_TIMEOUT
 def ensure_server(
     *,
     state_dir: Path | None = None,
+    host: str | None = None,
     port: int | None = None,
-    idle_seconds: float = DEFAULT_IDLE_SECONDS,
+    idle_seconds: float | None = None,
     ui_dir: Path | None = None,
     timeout_s: float = _ENSURE_TIMEOUT_S,
 ) -> dict[str, Any]:
     """Ensure a single Swarm Board server instance is healthy, spawning detached if needed."""
+    cfg = load_user_config()
+    target_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
+    resolved_idle = resolve_idle_seconds(idle_seconds, use_env_and_config=True, config=cfg)
+
     resolved_state = get_state_dir(state_dir)
     resolved_state.mkdir(parents=True, exist_ok=True)
     lock_path = resolved_state / "ensure.lock"
@@ -1278,11 +1756,15 @@ def ensure_server(
         try:
             reused = _try_reuse_existing(
                 state_file,
+                requested_host=target_host,
                 requested_port=port,
                 timeout=_HEALTH_PROBE_TIMEOUT_S,
+                config=cfg,
             )
             if reused is not None:
                 return reused
+
+            _stop_mismatched_host_if_verified(state_file, target_host, wait_s=2.0)
 
             proc: subprocess.Popen[bytes] | None = None
             watch_pid = _active_starting_pid(starting_file, max_age_s=timeout_s)
@@ -1293,8 +1775,9 @@ def ensure_server(
                     pass
                 proc = _spawn_detached_server(
                     resolved_state,
+                    host=target_host,
                     port=port,
-                    idle_seconds=idle_seconds,
+                    idle_seconds=resolved_idle,
                     explicit_state_dir=state_dir,
                     ui_dir=ui_dir,
                 )
@@ -1310,8 +1793,10 @@ def ensure_server(
                     # Another concurrent instance may have won the port race just before exit.
                     race_reused = _try_reuse_existing(
                         state_file,
+                        requested_host=target_host,
                         requested_port=port,
                         timeout=_HEALTH_PROBE_TIMEOUT_S,
+                        config=cfg,
                     )
                     if race_reused is not None:
                         return race_reused
@@ -1322,28 +1807,38 @@ def ensure_server(
                 data = _read_json_file(state_file)
                 if data is not None and isinstance(data.get("port"), int):
                     candidate_port = int(data["port"])
-                    if port is None or port <= 0 or candidate_port == port:
-                        health = _probe_health(candidate_port, timeout=_HEALTH_PROBE_TIMEOUT_S)
+                    data_host = _state_entry_host(data)
+                    if data_host == target_host and (port is None or port <= 0 or candidate_port == port):
+                        health = _probe_health(
+                            candidate_port,
+                            host=target_host,
+                            timeout=_HEALTH_PROBE_TIMEOUT_S,
+                        )
                         if health is not None:
                             try:
                                 starting_file.unlink()
                             except OSError:
                                 pass
                             out_port = int(health["port"])
+                            resp_host = str(health.get("host") or target_host)
                             return {
                                 "ok": True,
+                                "host": resp_host,
                                 "port": out_port,
-                                "url": f"http://{BIND_HOST}:{out_port}",
+                                "url": f"http://{resp_host}:{out_port}",
+                                "local_url": f"http://{BIND_HOST}:{out_port}",
                                 "pid": int(health["pid"]),
                                 "started": True,
+                                "open_in_preview": resolve_open_in_preview(resp_host, config=cfg),
                             }
 
                 if proc is None and watch_pid is not None and not _is_pid_alive(watch_pid):
                     # Previously starting process died before writing server.json; spawn fresh.
                     proc = _spawn_detached_server(
                         resolved_state,
+                        host=target_host,
                         port=port,
-                        idle_seconds=idle_seconds,
+                        idle_seconds=resolved_idle,
                         explicit_state_dir=state_dir,
                         ui_dir=ui_dir,
                     )
@@ -1365,11 +1860,20 @@ def ensure_server(
 def hook_ensure_server(
     *,
     state_dir: Path | None = None,
+    host: str | None = None,
     port: int | None = None,
-    idle_seconds: float = DEFAULT_IDLE_SECONDS,
+    idle_seconds: float | None = None,
     ui_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Fast non-blocking hook entrypoint: spawns server if needed and returns {} immediately."""
+    cfg = load_user_config()
+    try:
+        target_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
+        resolved_idle = resolve_idle_seconds(idle_seconds, use_env_and_config=True, config=cfg)
+    except (ValueError, RuntimeError) as exc:
+        _LOGGER.debug("Hook host/idle resolution failed: %s", exc)
+        return {}
+
     resolved_state = get_state_dir(state_dir)
     resolved_state.mkdir(parents=True, exist_ok=True)
     lock_path = resolved_state / "ensure.lock"
@@ -1384,10 +1888,13 @@ def hook_ensure_server(
         try:
             if _try_reuse_existing(
                 state_file,
+                requested_host=target_host,
                 requested_port=port,
                 timeout=_HOOK_PROBE_TIMEOUT_S,
+                config=cfg,
             ) is not None:
                 return {}
+            _stop_mismatched_host_if_verified(state_file, target_host, wait_s=0.2)
             if _active_starting_pid(starting_file) is not None:
                 return {}
             try:
@@ -1396,8 +1903,9 @@ def hook_ensure_server(
                 pass
             proc = _spawn_detached_server(
                 resolved_state,
+                host=target_host,
                 port=port,
-                idle_seconds=idle_seconds,
+                idle_seconds=resolved_idle,
                 explicit_state_dir=state_dir,
                 ui_dir=ui_dir,
             )
@@ -1413,31 +1921,56 @@ def hook_ensure_server(
 def server_status(
     *,
     state_dir: Path | None = None,
+    host: str | None = None,
     port: int | None = None,
     timeout: float = 1.0,
 ) -> dict[str, Any]:
-    """Check whether a Swarm Board server is alive for state_dir/port."""
+    """Check whether a Swarm Board server is alive for state_dir/host/port."""
+    cfg = load_user_config()
     resolved_state = get_state_dir(state_dir)
     state_file = resolved_state / "server.json"
     data = _read_json_file(state_file)
-    candidates: list[int] = []
+
+    explicit_host: str | None = None
+    if host is not None:
+        try:
+            explicit_host = resolve_bind_host(host, use_env_and_config=False)
+        except (ValueError, RuntimeError):
+            explicit_host = None
+
+    candidates: list[tuple[str, int]] = []
     if data is not None and isinstance(data.get("port"), int):
         entry_port = int(data["port"])
-        if port is None or port <= 0 or entry_port == port:
-            candidates.append(entry_port)
-    if port is not None and port > 0 and port not in candidates:
-        candidates.append(int(port))
+        entry_host = _state_entry_host(data)
+        if (
+            (explicit_host is None or entry_host == explicit_host)
+            and (port is None or port <= 0 or entry_port == port)
+        ):
+            candidates.append((entry_host, entry_port))
 
-    for candidate in candidates:
-        health = _probe_health(candidate, timeout=timeout)
+    if port is not None and port > 0:
+        try:
+            probe_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
+        except (ValueError, RuntimeError):
+            probe_host = BIND_HOST
+        cand = (probe_host, int(port))
+        if cand not in candidates:
+            candidates.append(cand)
+
+    for cand_host, cand_port in candidates:
+        health = _probe_health(cand_port, host=cand_host, timeout=timeout)
         if health is not None:
             bound_port = int(health["port"])
+            bound_host = str(health.get("host") or cand_host)
             return {
                 "ok": True,
                 "running": True,
                 "pid": int(health["pid"]),
+                "host": bound_host,
                 "port": bound_port,
-                "url": f"http://{BIND_HOST}:{bound_port}",
+                "url": f"http://{bound_host}:{bound_port}",
+                "local_url": f"http://{BIND_HOST}:{bound_port}",
+                "open_in_preview": resolve_open_in_preview(bound_host, config=cfg),
                 "health": health,
             }
 
@@ -1451,13 +1984,14 @@ def server_status(
 def stop_server(
     *,
     state_dir: Path | None = None,
+    host: str | None = None,
     port: int | None = None,
     timeout_s: float = 5.0,
 ) -> dict[str, Any]:
     """Stop a verified Swarm Board server process cleanly."""
     resolved_state = get_state_dir(state_dir)
     state_file = resolved_state / "server.json"
-    status = server_status(state_dir=resolved_state, port=port, timeout=1.0)
+    status = server_status(state_dir=resolved_state, host=host, port=port, timeout=1.0)
     if not status.get("running"):
         return {
             "ok": True,
@@ -1467,6 +2001,7 @@ def stop_server(
 
     pid = int(status["pid"])
     bound_port = int(status["port"])
+    bound_host = str(status.get("host") or BIND_HOST)
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -1484,29 +2019,38 @@ def stop_server(
         "ok": True,
         "stopped": stopped,
         "pid": pid,
+        "host": bound_host,
         "port": bound_port,
     }
 
 
 def run_server(
     *,
+    host: str | None = None,
     port: int | None = None,
-    idle_seconds: float = DEFAULT_IDLE_SECONDS,
+    idle_seconds: float | None = None,
     state_dir: Path | None = None,
     ui_dir: Path | None = None,
     registry: Any | None = None,
     force_refresh: bool = False,
+    allowed_hosts: Iterable[str] | None = None,
 ) -> int:
     """Run the Swarm Board HTTP/SSE server until signal or idle auto-exit."""
+    cfg = load_user_config()
+    bind_host = resolve_bind_host(host, use_env_and_config=True, config=cfg)
+    resolved_idle = resolve_idle_seconds(idle_seconds, use_env_and_config=True, config=cfg)
+
     resolved_state = get_state_dir(state_dir)
     state_file = resolved_state / "server.json"
     starting_file = resolved_state / "starting.json"
 
     server = create_server(
         registry=registry,
+        host=bind_host,
         port=port,
         ui_dir=ui_dir,
-        idle_seconds=idle_seconds,
+        idle_seconds=resolved_idle,
+        allowed_hosts=allowed_hosts,
     )
     if force_refresh:
         try:
@@ -1519,8 +2063,10 @@ def run_server(
         state_file,
         {
             "pid": my_pid,
+            "host": server.bind_host,
             "port": server.bound_port,
-            "url": f"http://{BIND_HOST}:{server.bound_port}",
+            "url": f"http://{server.bind_host}:{server.bound_port}",
+            "local_url": f"http://{BIND_HOST}:{server.bound_port}",
             "started_at": datetime.now(tz=timezone.utc)
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
@@ -1571,16 +2117,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description="Read-only local HTTP + SSE server for Swarm Board.",
     )
     parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind host ('127.0.0.1', 'tailscale', or a loopback/100.64.0.0/10 Tailscale IPv4).",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="TCP port on 127.0.0.1 (0 for ephemeral, default scans 18420..18449).",
+        help="TCP port (0 for ephemeral, default scans 18420..18449).",
     )
     parser.add_argument(
         "--idle-seconds",
         type=float,
         default=None,
-        help="Auto-exit after N idle seconds with 0 SSE clients (0 disables, default 900).",
+        help="Auto-exit after N idle seconds with 0 SSE clients (0 disables, default 7200 / 2h).",
     )
     parser.add_argument(
         "--state-dir",
@@ -1627,23 +2178,17 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("--ensure, --hook, --status, and --stop are mutually exclusive\n")
         return 2
 
-    if args.idle_seconds is not None:
-        idle_s = float(args.idle_seconds)
-    else:
-        env_idle = os.environ.get("SWARM_BOARD_IDLE_SECONDS", "").strip()
-        idle_s = float(env_idle) if env_idle else DEFAULT_IDLE_SECONDS
-
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else None
     ui_dir = Path(args.ui_dir).expanduser() if args.ui_dir else None
 
     if args.status:
-        res = server_status(state_dir=state_dir, port=args.port)
+        res = server_status(state_dir=state_dir, host=args.host, port=args.port)
         sys.stdout.write(json.dumps(res) + "\n")
         sys.stdout.flush()
         return 0
 
     if args.stop:
-        res = stop_server(state_dir=state_dir, port=args.port)
+        res = stop_server(state_dir=state_dir, host=args.host, port=args.port)
         sys.stdout.write(json.dumps(res) + "\n")
         sys.stdout.flush()
         return 0 if (res.get("stopped") or not res.get("pid")) else 1
@@ -1651,8 +2196,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.hook:
         res = hook_ensure_server(
             state_dir=state_dir,
+            host=args.host,
             port=args.port,
-            idle_seconds=idle_s,
+            idle_seconds=args.idle_seconds,
             ui_dir=ui_dir,
         )
         sys.stdout.write(json.dumps(res) + "\n")
@@ -1663,8 +2209,9 @@ def main(argv: list[str] | None = None) -> int:
         try:
             res = ensure_server(
                 state_dir=state_dir,
+                host=args.host,
                 port=args.port,
-                idle_seconds=idle_s,
+                idle_seconds=args.idle_seconds,
                 ui_dir=ui_dir,
             )
             sys.stdout.write(json.dumps(res) + "\n")
@@ -1675,13 +2222,18 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.flush()
             return 1
 
-    return run_server(
-        port=args.port,
-        idle_seconds=idle_s,
-        state_dir=state_dir,
-        ui_dir=ui_dir,
-        force_refresh=bool(args.force_refresh),
-    )
+    try:
+        return run_server(
+            host=args.host,
+            port=args.port,
+            idle_seconds=args.idle_seconds,
+            state_dir=state_dir,
+            ui_dir=ui_dir,
+            force_refresh=bool(args.force_refresh),
+        )
+    except (ValueError, RuntimeError) as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 1
 
 
 if __name__ == "__main__":

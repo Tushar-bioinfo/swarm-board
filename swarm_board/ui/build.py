@@ -90,7 +90,7 @@ def minify_css(css: str) -> str:
                 i += 1
             prev = out[-1][-1] if out and out[-1] else ""
             nxt = css[i] if i < n else ""
-            if prev and nxt and prev not in "{}:;,>" and nxt not in "{}:;,>":
+            if prev and nxt and prev not in "{}:;,>" and nxt not in "{};,>":
                 out.append(" ")
         elif ch == ";" and i + 1 < n:
             j = i + 1

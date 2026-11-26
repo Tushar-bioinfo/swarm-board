@@ -21,7 +21,7 @@ function outRow(f, o, open) {
     try { const j = JSON.parse(o.body), tk = o.tableKey || Object.keys(j).find((k) => Array.isArray(j[k])); if (tk && Array.isArray(j[tk])) n = j[tk].length + ' rows'; } catch (e) { /* ignore */ }
   }
   const picking = S.pick != null, on = picking && S.pick.includes(o.id);
-  const mt = [esc(dir), n, a ? `<span style="color:${labC(a.lab)}">${esc(aName(a))}</span>` : '', esc(o.at)].filter(Boolean).join(' · ');
+  const mt = [esc(dir), n, a ? `<span style="color:${labC(a.lab)}">${esc(aLabel(a))}</span>` : '', esc(o.at)].filter(Boolean).join(' · ');
   return `<li class="bar${open ? ' on' : ''}"><button class="row1" data-out="${esc(o.id)}" ${picking ? `aria-pressed="${on}"` : ''}><span class="ic">${picking ? `<span class="lbox${on ? ' on' : ''}"></span>` : ICON[o.kind] || '▤'}</span><span><span class="nm">${esc(o.title)}</span><br><span class="mt">${mt}</span></span></button></li>`;
 }
 function renderOuts() {
@@ -39,7 +39,7 @@ function renderOuts() {
 function needsHTML(items, all) {
   if (!items.length) return EMP(`Nothing is waiting on you${all ? '' : ' in this flow'}.`);
   return items.map((it) => {
-    const nm = it.ag.slice(0, 3).map((a) => `<button class="ment" data-agent="${esc(a.id)}" data-flowid="${esc(it.flow.id)}" style="color:${labC(a.lab)}">${esc(trunc(aName(a), 26))}</button>`).join(', ');
+    const nm = it.ag.slice(0, 3).map((a) => `<button class="ment" data-agent="${esc(a.id)}" data-flowid="${esc(it.flow.id)}" style="color:${labC(a.lab)}">${esc(trunc(aLabel(a), 26))}</button>`).join(', ');
     const r = rootOf(it.flow);
     const acts = it.acts.map((k) => k === 'errors' && it.ag[0] ? `<button class="tbtn" data-agent="${esc(it.ag[0].id)}" data-flowid="${esc(it.flow.id)}">Read errors</button>`
       : k === 'chat' ? it.ag.map((a) => { const t = (a.links || []).find((l) => l.kind === 'thread') || ((r && r.links) || []).find((l) => l.kind === 'thread'); return t && t.href ? `<a class="tbtn" href="${esc(t.href)}">Open chat ↗</a>` : ''; }).find(Boolean) || ''
@@ -53,7 +53,7 @@ function overviewHTML(f) {
   const decSrc = f.decision && f.decision.source ? `<p class="note">From <button class="cite" data-flow="${esc(f.id)}" data-p="${esc(f.decision.source.split(':')[0])}" data-a="6" data-b="6">${esc(f.decision.source)}</button></p>` : '';
   return `<div class="kick mt20">Needs you</div>${needsHTML(needsOf(f))}
     ${f.decision ? `<div class="vk kick">Decision</div><div class="dec" style="margin-top:4px"><span class="w">${esc((f.decision.qualifier ? f.decision.qualifier + ' ' : '') + (f.decision.word || ''))}</span><button class="tbtn" data-go="compare">Read the verdicts →</button></div>${decSrc}` : ''}
-    <div class="vk kick">Latest</div>${latest.length ? latest.map((x) => { const a = agentOf(f, x.by); return `<div class="post"><div class="by" style="color:${labC(a && a.lab)}">${esc(a ? aName(a) : x.by)}<span class="t">${esc(x.at)}</span></div><div class="md" style="font-size:17px">${md(x.text).html}</div></div>`; }).join('') : EMP('No posts or results yet.')}
+    <div class="vk kick">Latest</div>${latest.length ? latest.map((x) => { const a = agentOf(f, x.by); return `<div class="post"><div class="by" style="color:${labC(a && a.lab)}">${esc(a ? aLabel(a) : x.by)}<span class="t">${esc(x.at)}</span></div><div class="md" style="font-size:17px">${md(x.text).html}</div></div>`; }).join('') : EMP('No posts or results yet.')}
     <div class="acts">${(f.posts || []).length ? `<button class="tbtn" data-go="feed">All ${f.posts.length} posts →</button>` : ''}<button class="tbtn" data-page="stats">Stats →</button></div>`;
 }
 let TT = 0;
@@ -71,7 +71,7 @@ function agentHTML(f, a) {
   const res = a.result || (a.verdict ? null : a.last), wsObj = a.workstream ? (f.workstreams || []).find((w) => w.id === a.workstream) : null, tid = threadLinkOf(a);
   const vk = (t, b) => `<div class="vk kick">${t}</div>${b}`;
   return `<div class="kick">Agent · ${esc(a.role)}${wsObj ? ' · ' + esc(wsObj.name) : ''}</div>
-    <h2 class="ah2">${esc(aName(a))}</h2>
+    <h2 class="ah2">${esc(aTask(a))}</h2>
     <div class="fx fxw">${emb(a.lab, a.state)}<span class="labl" style="color:${labC(a.lab)}">${esc(labN(a.lab))}</span> <span class="mono mist" style="font-size:15px">${esc(a.model || '')}</span></div>
     <div class="st" style="color:${isStop(a) ? C.bad : C.ink}">${sIcon(a.state, stateCol(a))}${esc(stateWord(a))}${a.verdict ? ` · ✓ ${esc(a.verdict)}` : ''}</div>
     <div class="tele"><div><span class="kick">Elapsed</span><b${a.state === 'running' ? ' data-live' : ''}>${a.durS != null ? fmtDur(a.durS) : '—'}</b></div><div><span class="kick">Tokens</span><b>${tok}</b></div><div><span class="kick">Est. cost</span><b>${fmtCost(a.costUsd, a.costEstimated)}</b></div></div>

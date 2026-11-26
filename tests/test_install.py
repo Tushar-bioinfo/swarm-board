@@ -204,6 +204,26 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(code_un, 0)
             self.assertTrue(marker.is_file())
 
+    def test_grok_skill_install_verify_and_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "grok-home"
+            (home / ".grok").mkdir(parents=True)
+
+            code_in, in_res = _run_installer(["--targets", "auto"], home=home, platform="linux")
+            self.assertEqual(code_in, 0, in_res)
+            self.assertIn("grok", in_res["targets"])
+            skill_link = home / ".grok" / "skills" / "swarm-board"
+            self.assertEqual(skill_link.resolve(), SKILL_DIR.resolve())
+
+            code_ver, ver_res = _run_installer(["--verify", "--targets", "grok"], home=home, platform="linux")
+            self.assertEqual(code_ver, 0, ver_res)
+            self.assertTrue(ver_res["ok"])
+
+            code_un, un_res = _run_installer(["--uninstall", "--targets", "grok"], home=home, platform="linux")
+            self.assertEqual(code_un, 0, un_res)
+            self.assertFalse(skill_link.exists())
+            self.assertFalse(skill_link.is_symlink())
+
 
 if __name__ == "__main__":
     unittest.main()

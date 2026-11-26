@@ -15,7 +15,7 @@ python3 scripts/install.py
 Useful flags:
 
 - `python3 scripts/install.py --dry-run` — preview symlink and hook changes without writing
-- `python3 scripts/install.py --targets antigravity,claude,codex` — override auto-detection
+- `python3 scripts/install.py --targets antigravity,claude,codex,grok` — override auto-detection
 - `python3 scripts/install.py --no-hooks` — install `/swarm-board` skill symlinks only
 - `python3 scripts/install.py --verify` — validate Python version, UI build, executable bits, skills, and hooks
 - `python3 scripts/install.py --uninstall` — remove only swarm-board symlinks and hooks (preserves all other configs)
@@ -49,7 +49,7 @@ If you ask an AI coding agent on a new Mac or Linux machine *"Set up swarm-board
 | **T3 Code & Antigravity (IDE / CLI)** | `statev2.sqlite` (`delegate_task` trees), Antigravity swarms (`brain/<id>/scratch/swarm/`), `agy` CLI transcripts | `/swarm-board` (`~/.gemini/config/skills/swarm-board` + macOS/Linux T3 Antigravity `config/skills`) | Yes — `~/.gemini/config/hooks.json` (`swarm-board`) wakes background server on `delegate_task`, `swarm`, `invoke_subagent`, `run_workflow` |
 | **Claude Code** | Agent Teams (`~/.claude/teams/*/config.json` + `~/.claude/tasks/*/*.json`), `Agent` / `Task` subagents (`~/.claude/projects/*/subagents/*.jsonl`), plus `$agent-delegate` / `$orchestrate` / `$committee` runs started from Claude Code | `/swarm-board` (`~/.claude/skills/swarm-board`) | Yes — `~/.claude/settings.json` (`hooks.PostToolUse`) wakes background server on `Agent`, `Task`, `TeamCreate`, `SendMessage`, `mcp__t3-code__delegate_task` |
 | **Codex** | `spawn_agent` subagents (`~/.codex/state_5.sqlite` + `~/.codex/sessions`), plus `$agent-delegate` / `$orchestrate` / `$committee` runs started from Codex | `/swarm-board` / `$swarm-board` (`~/.codex/skills/swarm-board`) | No hook needed — invoke `/swarm-board` on demand |
-| **Grok & Drop-in JSON** | `~/.grok/sessions/*/summary.json` + `usage.json`, plus drop-in JSON runs (`$AGENT_BOARD_DROPIN_DIR` or `~/.cache/agent-board/runs/*.json`) | Launches from any host shell via `scripts/ensure-server.sh` | Same host hook if started from T3 / Antigravity / Claude Code |
+| **Grok & Drop-in JSON** | `~/.grok/sessions/*/summary.json` + `usage.json`, plus drop-in JSON runs (`$AGENT_BOARD_DROPIN_DIR` or `~/.cache/agent-board/runs/*.json`) | `/swarm-board` (`~/.grok/skills/swarm-board`, linked by `scripts/install.py`) | No hook needed — invoke `/swarm-board` on demand |
 
 ---
 
@@ -61,9 +61,23 @@ If you ask an AI coding agent on a new Mac or Linux machine *"Set up swarm-board
 | **T3 Code userdata & Antigravity providers** | `~/.t3/userdata` | `~/Library/Application Support/T3 Code/userdata` (or `~/.t3/userdata`) | `T3_USERDATA_DIR` |
 | **Antigravity brain roots** | `~/.t3/userdata/providers/antigravity/*/antigravity-acp/brain`, `~/.gemini/*/brain` | `~/Library/Application Support/T3 Code/userdata/providers/antigravity/*/antigravity-acp/brain`, `~/.t3/...`, `~/.gemini/*/brain` | `T3_USERDATA_DIR` |
 | **Rates overrides (verified & LiteLLM cache)** | `~/.config/swarm-board/rates_override.json`, `~/.config/swarm-board/litellm-rates.json` | `~/.config/swarm-board/rates_override.json`, `~/.config/swarm-board/litellm-rates.json` | `SWARM_BOARD_RATES_OVERRIDE` |
-| **Server bind host & port scan** | `127.0.0.1:18420..18449` | `127.0.0.1:18420..18449` | `SWARM_BOARD_PORT` |
-| **Idle auto-exit timeout** | `900` seconds (0 MB idle RSS when closed) | `900` seconds (0 MB idle RSS when closed) | `SWARM_BOARD_IDLE_SECONDS` |
+| **Server bind host & port scan** | `127.0.0.1:18420..18449` (`tailscale` optional) | `127.0.0.1:18420..18449` | `SWARM_BOARD_HOST`, `SWARM_BOARD_PORT` |
+| **User host/preview config** | `~/.config/swarm-board/config.json` | `~/.config/swarm-board/config.json` | `SWARM_BOARD_CONFIG`, `SWARM_BOARD_OPEN_IN_PREVIEW` |
+| **Idle auto-exit timeout** | `7200` seconds (2h; 0 MB idle RSS when closed) | `7200` seconds (2h; 0 MB idle RSS when closed) | `SWARM_BOARD_IDLE_SECONDS` or `config.json` (`idle_seconds`) |
 | **Drop-in custom JSON flows** | `~/.cache/agent-board/runs/*.json` | `~/.cache/agent-board/runs/*.json` | `AGENT_BOARD_DROPIN_DIR` |
+
+### Viewing a Remote Linux VM Board from Your Mac (Tailscale Mode)
+
+When Swarm Board runs on a headless Linux VM and you want to open it directly in Chrome/Safari on your Mac without an SSH tunnel (and without opening T3 Code's VM preview panel), create `~/.config/swarm-board/config.json` on the VM:
+
+```json
+{
+  "host": "tailscale",
+  "open_in_preview": false
+}
+```
+
+Or pass `--host tailscale` / `SWARM_BOARD_HOST=tailscale`. In Tailscale mode, Swarm Board binds **only** the VM's Tailscale `100.64.0.0/10` IPv4 interface plus a companion `127.0.0.1` loopback listener on the same port (never `0.0.0.0` or public/LAN interfaces), validates Tailscale/MagicDNS/loopback `Host` headers, and returns both `url` (`http://<tailscale-ip>:18420`, for Mac) and `local_url` (`http://127.0.0.1:18420`, for VM).
 
 ---
 

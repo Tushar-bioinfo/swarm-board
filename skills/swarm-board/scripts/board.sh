@@ -22,11 +22,14 @@ case "$cmd" in
   rates)
     exec python3 "${REPO_ROOT}/scripts/update_rates.py" "$@"
     ;;
+  labels)
+    PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" exec python3 -m swarm_board.labeler "$@"
+    ;;
   verify)
     exec python3 "${REPO_ROOT}/scripts/install.py" --verify "$@"
     ;;
   *)
-    echo "Usage: board.sh [ensure|open|status|stop|rates|verify] [args...]" >&2
+    echo "Usage: board.sh [ensure|open|status|stop|rates|labels|verify] [args...]" >&2
     exit 2
     ;;
 esac

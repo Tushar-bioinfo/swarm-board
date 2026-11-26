@@ -6,8 +6,8 @@ Local, zero-dependency multi-agent viewer and cost/token telemetry dashboard for
 
 - **Halftone Plate Obsidian UI**: Unified board graph (`swarm` lanes, `tree` canopy pods, `committee` council seal, `fan` DAG), resizable split reader with markdown/table/code/media/citation previews, keyboard shortcuts, and live `Last 5 messages` inspection.
 - **T3-Style Stats Dashboard**: Monotone spline charts (`Cost`, `Tokens`, `Time`) across `Past 24h`, `7 days`, and `All`, cache savings breakdown, model & agent drilldowns, and automatic deduplication of duplicate T3 `node:*` continuations and cross-adapter child sessions.
-- **0 MB Idle Footprint**: Runs strictly on `127.0.0.1` with zero third-party packages (`python3` 3.10+ stdlib only) and auto-exits 15 minutes after the last open tab closes.
-- **Read-Only & Sandboxed**: Only reads workspace/harness artifacts, enforces loopback `Host` headers and `GET`/`HEAD`, redacts secret filenames, and keeps path containment checks on all file/media endpoints.
+- **0 MB Idle Footprint**: Runs strictly on `127.0.0.1` by default (or optionally binds strictly to your Tailscale IPv4 interface for remote VM → Mac viewing) with zero third-party packages (`python3` 3.10+ stdlib only) and auto-exits 2 hours after the last open tab closes.
+- **Read-Only & Sandboxed**: Only reads workspace/harness artifacts, enforces allowlisted `Host` headers and `GET`/`HEAD`, redacts secret filenames, and keeps path containment checks on all file/media endpoints.
 
 ## Quickstart
 

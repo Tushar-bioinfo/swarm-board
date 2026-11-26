@@ -3,9 +3,9 @@ function canopy(f, B, det) {
   const root = rootOf(f), leads = root ? kids(f, root.id) : [];
   if (!root || !leads.length || leads.every((l) => !kids(f, l.id).length)) return fan(f, B, det);
   const W = B.W, k = B.k, R = Math.round, Dt = S.details, Sm = det === 'S', Lg = det === 'L', sn = shortNames(leads), rs = Sm ? 28 : R(32 * k), ry = R(36 * k);
-  const P = Sm ? 12 : Lg ? 24 : 20, colW = (W - 2 * P) / (Sm ? Math.min(4, leads.length) : leads.length), uni = leads.every((l) => tw(sn[l.id], 15, 400, 1) <= colW - 8), full = Dt && leads.every((l) => tw(aName(l), 15, 400, 1) <= colW - 8), ls = R((Lg ? 26 : 24) * k), pw = R((Lg ? 24 : 20) * k), pp = R((Lg ? 18 : 16) * k), ps = Lg ? Math.min(13, R(12 * k)) : 10, u = leads.findIndex((l) => l.id === S.unfold);
+  const P = Sm ? 12 : Lg ? 24 : 20, colW = (W - 2 * P) / (Sm ? Math.min(4, leads.length) : leads.length), uni = leads.every((l) => tw(sn[l.id], 15, 400, 1) <= colW - 8), full = Dt && leads.every((l) => tw(aLabel(l), 15, 400, 1) <= colW - 8), ls = R((Lg ? 26 : 24) * k), pw = R((Lg ? 24 : 20) * k), pp = R((Lg ? 18 : 16) * k), ps = Lg ? Math.min(13, R(12 * k)) : 10, u = leads.findIndex((l) => l.id === S.unfold);
   B.node(root, W / 2, ry, rs, { med: 1, R: rs / 2 + 16 });
-  B.label({ x: W / 2 + rs / 2 + 20, y: ry + 6, size: 17, wt: 600, for: root.id, steps: [trunc(aName(root), 26), 'root'] });
+  B.label({ x: W / 2 + rs / 2 + 20, y: ry + 6, size: 17, wt: 600, for: root.id, steps: [trunc(aLabel(root), 26), 'root'] });
   const pos = leads.map((l, i) => {
     if (Sm) return [P + ((i % 4) + 0.5) * colW, i < 4 ? 104 : 296, i < 4 ? 0 : 1];
     const x = P + (i + 0.5) * colW, q = leads.length > 1 ? (x - W / 2) / (W / 2 - P) : 0;
@@ -18,25 +18,25 @@ function canopy(f, B, det) {
     B.cable(row ? `M${W / 2} ${ry + 14}V${y - 60}C${W / 2} ${y - 34} ${f1(x)} ${y - 46} ${f1(x)} ${y - 14}` : `M${W / 2} ${ry + 16}C${W / 2} ${ry + 50} ${f1(x)} ${f1(y - 46)} ${f1(x)} ${f1(y - 16)}`, l, { cls: fold ? 'fold' : '' });
     B.node(l, x, y, ls, { cls: fold ? 'fold' : u === i ? 'pick' : '' });
     const ws = kids(f, l.id).slice().sort((a, b) => (b.state === 'running') - (a.state === 'running')), top = y + ls / 2 + (Dt ? 53 : 33), ph = ws.length * pp + (Lg ? 12 : 10), nr = ws.filter((w) => w.state === 'running').length, ix = String(i + 1);
-    B.label({ x, y: y + ls / 2 + 23, size: 15, mono: 1, anchor: 'middle', for: l.id, maxX: x + colW / 2 - 4, steps: full ? [trunc(aName(l), 24), sn[l.id], ix] : uni ? [sn[l.id], ix] : [ix] });
+    B.label({ x, y: y + ls / 2 + 23, size: 15, mono: 1, anchor: 'middle', for: l.id, maxX: x + colW / 2 - 4, steps: full ? [trunc(aLabel(l), 24), sn[l.id], ix] : uni ? [sn[l.id], ix] : [ix] });
     if (Dt) B.label({ x, y: y + ls / 2 + 43, size: 15, mono: 1, fill: C.mist, anchor: 'middle', for: l.id, steps: [`${nr}/${ws.length}`] });
     B.pods += `<path class="pst" d="M${f1(x)} ${f1(y + ls / 2 + 3)}V${f1(top)}" stroke="${nr ? L.base : C.mist}" stroke-opacity="${nr ? 0.7 : 0.45}" stroke-width="1.6" stroke-linecap="round" stroke-dasharray=".01 3.2"/>` + (nr ? `<path class="march pst" d="M${f1(x)} ${f1(y + ls / 2 + 3)}V${f1(top)}" stroke="${L.hi}"/>` : '');
     const pips = ws.map((w, j) => { const py = top + 13 + j * pp; ghost[w.id] = [x, py]; return `<g class="pip${w.state === 'running' ? ' run' : ''}" transform="translate(${f1(x)} ${f1(py)})">${tokIn(w, ps)}</g>`; }).join('');
-    B.pods += `<g class="pod" data-lead="${esc(l.id)}" ${BATR(`${aName(l)}, ${ws.length} workers, ${nr} running. Enter unfolds`)}><rect x="${f1(x - pw / 2)}" y="${f1(top)}" width="${pw}" height="${ph}" rx="${pw / 2}" fill="#111214" stroke="${nr ? L.base : C.mist}" stroke-opacity="${nr ? 0.75 : 0.45}" stroke-width="1.6" stroke-linecap="round" stroke-dasharray=".01 3.2"/>${pips}</g>`;
+    B.pods += `<g class="pod" data-lead="${esc(l.id)}" ${BATR(`${aLabel(l)}, ${ws.length} workers, ${nr} running. Enter unfolds`)}><rect x="${f1(x - pw / 2)}" y="${f1(top)}" width="${pw}" height="${ph}" rx="${pw / 2}" fill="#111214" stroke="${nr ? L.base : C.mist}" stroke-opacity="${nr ? 0.75 : 0.45}" stroke-width="1.6" stroke-linecap="round" stroke-dasharray=".01 3.2"/>${pips}</g>`;
     H = Math.max(H, top + ph + 24);
   });
   if (u >= 0) {
     const lv = kids(f, S.unfold), m = lv.length, [xc, yc] = pos[u], yD = Sm ? 296 : Math.max(...pos.map((p) => p[1])), sp = Math.min(88, (W - 2 * P) / Math.max(1, m));
     let yb = 0;
     lv.forEach((w, j) => {
-      const t = m > 1 ? (j - (m - 1) / 2) / ((m - 1) / 2) : 0, x = W / 2 + (j - (m - 1) / 2) * sp, y = yD + 110 + 16 * (1 - t * t), g = ghost[w.id] || [xc, yc], nm = aName(w);
+      const t = m > 1 ? (j - (m - 1) / 2) / ((m - 1) / 2) : 0, x = W / 2 + (j - (m - 1) / 2) * sp, y = yD + 110 + 16 * (1 - t * t), g = ghost[w.id] || [xc, yc], nm = aLabel(w);
       B.cable(`M${f1(xc)} ${f1(yc + 15)}C${f1(xc)} ${f1(yc + 70)} ${f1(x)} ${f1(y - 60)} ${f1(x)} ${f1(y - 14)}`, w, { cls: 'lw' });
       B.node(w, x, y, 20, { cls: 'leaf', attr: ` data-fl="${f1(g[0])},${f1(g[1])},${f1(x)},${f1(y)}"` });
       B.label({ x, y: y + 35, size: 17, wt: 600, anchor: 'middle', for: w.id, steps: [trunc(nm, 16), trunc(nm, 10), String(j + 1)] });
       if (Lg && Dt) B.label({ x, y: y + 55, size: 15, fill: C.mist, anchor: 'middle', for: w.id, steps: [stateWord(w)] });
       yb = Math.max(yb, y + (Lg && Dt ? 55 : 35));
     });
-    B.label({ x: W / 2, y: yb + 30, size: 15, fill: C.mist, anchor: 'middle', steps: [`${trunc(aName(leads[u]), 24)} · ${m} workers · Esc folds`, `${m} workers · Esc folds`] });
+    B.label({ x: W / 2, y: yb + 30, size: 15, fill: C.mist, anchor: 'middle', steps: [`${trunc(aLabel(leads[u]), 24)} · ${m} workers · Esc folds`, `${m} workers · Esc folds`] });
     H = Math.max(H, yb + 46);
   }
   return H;
@@ -81,7 +81,7 @@ function fan(f, B, det) {
   const d1 = rows.filter((r) => r[1] === 1), HY = d1.length ? d1.reduce((t, r) => t + r[2], 0) / d1.length : 40, hr = hs / 2, x0 = HX + (singleRoot ? hr + (Sm ? 6 : 16) : 14);
   if (singleRoot) {
     B.node(singleRoot, HX, HY, hs, { med: !Sm, R: hr + (Sm ? 0 : 16) });
-    B.label({ x: HX, y: HY + hr + (Sm ? 26 : 38), size: 17, wt: 600, anchor: 'middle', for: singleRoot.id, steps: [trunc(aName(singleRoot), 16), 'root'] });
+    B.label({ x: HX, y: HY + hr + (Sm ? 26 : 38), size: 17, wt: 600, anchor: 'middle', edge: 1, for: singleRoot.id, steps: [trunc(aLabel(singleRoot), 18), 'root'] });
   } else {
     B.bg += `<circle cx="${HX}" cy="${f1(HY)}" r="6" fill="${C.bg}" stroke="${C.line}" stroke-width="1.5"/>`;
     B.label({ x: HX, y: HY + 26, size: 14, mono: 1, fill: C.mist, anchor: 'middle', steps: [HARN[f.harness] || f.harness || 'run'] });
@@ -92,9 +92,9 @@ function fan(f, B, det) {
     if (d === 1 || !pos[par]) { const x1 = X - r - 4, dx = x1 - x0; B.cable([[x0, HY], [x0 + 0.5 * dx, HY], [x1 - 0.5 * dx, y], [x1, y]], a); }
     else { const p = pos[par]; B.cable(`M${f1(p[0])} ${f1(p[1] + p[2] + 4)}V${f1(y - 10)}Q${f1(p[0])} ${f1(y)} ${f1(p[0] + 10)} ${f1(y)}H${f1(X - r - 4)}`, a); }
     B.node(a, X, y, s);
-    const lx = X + r + 14, L = LB(a.lab), sw = stateWord(a), sep = [' · ', C.mist], stt = [sw, isStop(a) ? C.bad : C.mist], lab = [labN(a.lab), L.txt], mo = [a.model || '', C.mist, 1], nm = aName(a);
+    const lx = X + r + 14, L = LB(a.lab), sw = stateWord(a), sep = [' · ', C.mist], stt = [sw, isStop(a) ? C.bad : C.mist], lab = [labN(a.lab), L.txt], mo = [a.model || '', C.mist, 1], nm = aLabel(a);
     const J = (...p) => p.filter((q) => q[0]).flatMap((q, i) => (i ? [sep, q] : [q]));
-    B.label({ x: lx, y: S.details ? y - 3 : y + 6, size: 17, wt: 600, for: a.id, steps: [nm, trunc(nm, 44), trunc(nm, 28), trunc(nm, 16)] });
+    B.label({ x: lx, y: S.details ? y - 3 : y + 6, size: 17, wt: 600, for: a.id, steps: [nm, trunc(nm, 28), trunc(nm, 16)] });
     if (S.details) B.label({ x: lx, y: y + 17, size: 15, fill: C.mist, for: a.id, steps: Sm ? [[stt]] : isStop(a) ? [J(stt, lab, mo), J(stt, lab), [stt]] : [J(lab, mo, stt), J(lab, mo), J(mo), J(lab)] });
   });
   return Math.max(last + 40, HY + hr + 50);
