@@ -1,14 +1,16 @@
 // ===== stats.js: Live Stats page powered by GET /api/stats =====
 const pgv = () => (S.page === 'stats' ? 'stats' : 'overview');
-const aCalls = (a) => ((a && a.trace) || []).reduce((s, y) => s + y[1], 0);
+const aCalls = (a) => ((a && a.trace) || []).reduce((s, y) => s + (typeof y[1] === 'number' ? y[1] : 0), 0);
+const pct = (v) => (v == null ? '—' : Number(v).toFixed(1) + '%');
+const cnt = (v) => (v > 0 ? Math.round(v).toLocaleString() : '—');
 const STS = ['running', 'done', 'stopped', 'interrupted'], MON = 'Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec'.split(' ');
 const stOf = (s) => ({ killed: 'stopped', error: 'stopped', waiting: 'running', stale: 'done', queued: 'done' }[s] || s);
 const money = (v, e) => (e ? '~' : '') + '$' + Number(v || 0).toFixed(2).replace(/\B(?=(\d{3})+\.)/g, ',');
 const p2 = (n) => String(n).padStart(2, '0');
 const dOf = (ts) => new Date(ts * 1000), dayL = (ts) => { const d = dOf(ts); return MON[d.getUTCMonth()] + ' ' + d.getUTCDate(); };
 const hmL = (ts) => { const d = dOf(ts); return p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()); };
-const Z = () => ({ cost: 0, tok: 0, in: 0, cache: 0, out: 0, dur: 0, sav: 0, n: 0, r: 0, st: {} });
-function addTo(g, v) { ['cost', 'tok', 'in', 'cache', 'out', 'dur', 'sav'].forEach((k) => (g[k] += v[k] || 0)); for (const s in v.st || {}) g.st[s] = (g.st[s] || 0) + v.st[s]; return g; }
+const Z = () => ({ cost: 0, tok: 0, in: 0, cache: 0, cr: 0, out: 0, dur: 0, sav: 0, calls: 0, n: 0, r: 0, st: {} });
+function addTo(g, v) { ['cost', 'tok', 'in', 'cache', 'cr', 'out', 'dur', 'sav', 'calls'].forEach((k) => (g[k] += v[k] || 0)); for (const s in v.st || {}) g.st[s] = (g.st[s] || 0) + v.st[s]; return g; }
 function bucketsOf(w, lo, hi) {
   if (!w || !w.b || !w.b.length || !w.step || hi < lo) return [];
   if (hi - lo > 2000) lo = hi - 2000;
@@ -25,7 +27,7 @@ function labsFromModels(models, buckets) {
   const L = {};
   (models || []).forEach((m) => {
     const lb = m.lab || 'other', g = (L[lb] = L[lb] || Z());
-    addTo(g, { cost: m.costUsd || 0, in: m.in || 0, cache: m.cache || 0, out: m.out || 0, tok: (m.in || 0) + (m.cache || 0) + (m.out || 0), dur: m.durS || 0, sav: m.cacheSav || 0 });
+    addTo(g, { cost: m.costUsd || 0, in: m.in || 0, cache: m.cache || 0, cr: m.cacheRead != null ? m.cacheRead : (m.cache || 0), out: m.out || 0, tok: (m.in || 0) + (m.cache || 0) + (m.out || 0), dur: m.durS || 0, sav: m.cacheSav || 0, calls: m.toolCalls || 0 });
     g.n += m.agents || 0; g.r += m.rated || 0;
   });
   (buckets || []).forEach((b) => { for (const lb in b.labs) { const g = (L[lb] = L[lb] || Z()); for (const s in b.labs[lb].st || {}) g.st[s] = (g.st[s] || 0) + b.labs[lb].st[s]; } });
@@ -54,18 +56,21 @@ function statsModel(st, f) {
   for (const k in L) if (!lab || k === lab) addTo(T, L[k]);
   if (st.costUsd != null) T.cost = st.costUsd;
   if (st.cacheSavingsUsd != null) T.sav = st.cacheSavingsUsd;
+  if (st.toolCalls != null) T.calls = st.toolCalls;
+  T.hit = st.cacheHitPct != null ? st.cacheHitPct : (T.in + T.cache > 0 ? 100 * T.cr / (T.in + T.cache) : null);
   if (!all && f && !Object.keys(T.st).length) (f.agents || []).forEach((a) => { if (!lab || a.lab === lab) { const s = stOf(a.state); T.st[s] = (T.st[s] || 0) + (a.durS || 0); } });
   const MD = {};
   (st.byModel || []).forEach((m) => {
     if (lab && m.lab !== lab) return;
-    MD[m.model] = { m: m.model, lab: m.lab, n: m.agents || 0, dur: m.durS || 0, in: m.in || 0, cache: m.cache || 0, out: m.out || 0, tok: (m.in || 0) + (m.cache || 0) + (m.out || 0), cost: m.costUsd || 0, sav: m.cacheSav || 0, r: m.rated || 0, e: m.costEstimated !== false };
+    const mi = m.in || 0, mc = m.cache || 0, mcr = m.cacheRead != null ? m.cacheRead : mc;
+    MD[m.model] = { m: m.model, lab: m.lab, n: m.agents || 0, dur: m.durS || 0, in: mi, cache: mc, cr: mcr, out: m.out || 0, tok: mi + mc + (m.out || 0), cost: m.costUsd || 0, sav: m.cacheSav || 0, calls: m.toolCalls || 0, hit: m.cacheHitPct != null ? m.cacheHitPct : (mi + mc > 0 ? 100 * mcr / (mi + mc) : null), r: m.rated || 0, e: m.costEstimated !== false };
   });
   const typesCost = st.costByType || { cached: 0, uncached: 0, output: 0 };
   const agents = (st.topAgents || []).map((a) => {
     const flId = a[12] || fid, agId = a[13] || '';
     const ag = (f && flId === f.id ? agentOf(f, agId) : null) || (!all && f ? agentOf(f, agId) : null);
     return { a: ag, id: a[0] || agId, flow: a[1] || '', model: a[2], lab: a[3] || 'other', state: a[4] || 'done', flowId: flId, agentId: agId,
-      g: { dur: a[5] || 0, in: a[6] || 0, cache: a[7] || 0, out: a[8] || 0, tok: (a[6] || 0) + (a[7] || 0) + (a[8] || 0), cost: a[9] || 0, r: a[9] != null ? 1 : 0, x: ag ? aCalls(ag) : 0 } };
+      g: { dur: a[5] || 0, in: a[6] || 0, cache: a[7] || 0, out: a[8] || 0, tok: (a[6] || 0) + (a[7] || 0) + (a[8] || 0), cost: a[9] || 0, r: a[9] != null ? 1 : 0, x: a[14] != null ? a[14] : (ag ? aCalls(ag) : 0) } };
   });
   const key = S.met, est = (st.byModel || []).length ? st.byModel.some((m) => m.costEstimated !== false) : true;
   V.est = est ? 1 : 0;
@@ -108,7 +113,7 @@ function renderStats() {
 <div class="ssub meta">${esc(all ? `All flows · ${rngTxt}` : `${f.title} · ${f.project || HARN[f.harness] || f.harness} · ${HARN[f.harness] || f.harness}`)}</div>
 <div class="shero"><div class="sleft"><div class="hnum">${hero}</div><div class="meta hsub">${esc(V.sub)}</div><div class="slabs">${lr || '<p class="meta">No lab telemetry in this range.</p>'}</div></div>
 <div class="sright"><div class="ctl">${ttl}${LB}</div><div class="schart" id="schart"></div></div></div>
-<div class="stot"><div class="sh">Totals${LB}</div><div class="tg">${tot('Processed tokens', fmtTok(T.tok))}${tot('Cached input', fmtTok(T.cache))}${tot('Uncached input', fmtTok(T.in))}${tot('Output', fmtTok(T.out))}${tot('Cache savings', T.sav > 0 ? money(T.sav, 1) : '—')}</div></div>
+<div class="stot"><div class="sh">Totals${LB}</div><div class="tg">${tot('Processed tokens', fmtTok(T.tok))}${tot('Cached input', fmtTok(T.cache))}${tot('Uncached input', fmtTok(T.in))}${tot('Output', fmtTok(T.out))}${tot('Cache hit', pct(T.hit))}${tot('Tool calls', cnt(T.calls))}</div></div>
 <div class="sbars">${typeBar(V)}${modelBar(V)}</div>
 <div class="sdd"><div class="seats" role="tablist">${b('stab', 'model', 'By model')}${b('stab', 'agent', 'By agent')}${all ? '' : b('stab', 'flow', 'Flow details')}</div>${drill(V)}</div>`;
   drawChart();

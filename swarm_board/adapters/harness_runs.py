@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -328,7 +329,7 @@ class _GrokUsageLookup:
         cached_read = int(sess.get("cachedReadTokens") or 0)
         cache_create = int(sess.get("cacheCreationTokens") or 0)
         out_tok = int(sess.get("outputTokens") or 0)
-        in_tok = max(0, total_in - cached_read)
+        in_tok = max(0, total_in - cached_read - cache_create)
         ticks = sess.get("costUsdTicks")
         cost_usd = (
             round(float(ticks) / 1e10, 4)
@@ -370,12 +371,13 @@ class _AgyTranscriptLookup:
             cached = _AGY_TRANSCRIPT_CACHE.get(key)
             if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
                 rec = cached[2]
-                return (rec if (rec["in"] or rec["cache"] or rec["out"]) else None), tr_path
+                return (rec if (rec["in"] or rec["cache"] or rec["out"] or rec.get("trace")) else None), tr_path
 
             in_tok = 0
             cache_tok = 0
             out_tok = 0
             model: str | None = None
+            tool_counts: Counter[str] = Counter()
             try:
                 with open(tr_path, "r", encoding="utf-8", errors="replace") as fh:
                     for line in fh:
@@ -393,18 +395,27 @@ class _AgyTranscriptLookup:
                         m = obj.get("model")
                         if isinstance(m, str) and m.strip():
                             model = m.strip()
+                        tcs = obj.get("tool_calls")
+                        if isinstance(tcs, list):
+                            for tc in tcs:
+                                if isinstance(tc, dict):
+                                    tname = str(tc.get("name") or "").strip()
+                                    if tname:
+                                        tool_counts[tname] += 1
             except OSError:
                 continue
 
+            trace = [[name, count] for name, count in tool_counts.most_common()]
             rec = {
                 "in": in_tok,
                 "cache": cache_tok,
                 "out": out_tok,
                 "model": model,
                 "costUsd": None,
+                "trace": trace,
             }
             _AGY_TRANSCRIPT_CACHE[key] = (sig[0], sig[1], rec)
-            if in_tok or cache_tok or out_tok:
+            if in_tok or cache_tok or out_tok or trace:
                 return rec, tr_path
             return None, tr_path
         return None, None
@@ -422,13 +433,15 @@ def _resolve_usage_and_cost(
     grok_lookup: _GrokUsageLookup | None,
     agy_lookup: _AgyTranscriptLookup | None = None,
     rate_table: RateTable | None,
-) -> tuple[dict[str, int] | None, float | None, bool, Path | None]:
-    """Join session_id to real tokens/cost via UsageIndex -> Grok usage.json -> AGY transcript -> fallback."""
+) -> tuple[dict[str, int] | None, float | None, bool, Path | None, int | None, list[list[Any]]]:
+    """Join session_id to real tokens/cost/cacheRead/trace via UsageIndex -> Grok usage.json -> AGY transcript -> fallback."""
     tokens: dict[str, int] | None = None
     cost_usd: float | None = None
     cost_estimated = True
     usage_rec: dict[str, Any] | None = None
     transcript_path: Path | None = None
+    cache_read: int | None = None
+    trace: list[list[Any]] = []
 
     if reported_cost is not None:
         try:
@@ -448,6 +461,7 @@ def _resolve_usage_and_cost(
             "cache": int(usage_rec.get("cache", 0) or 0),
             "out": int(usage_rec.get("out", 0) or 0),
         }
+        cache_read = usage_rec.get("cacheRead")
         if cost_usd is None:
             rec_cost = usage_rec.get("costUsd")
             if rec_cost is not None:
@@ -475,21 +489,24 @@ def _resolve_usage_and_cost(
     if tokens is None and session_id and agy_lookup is not None and is_google_agy:
         agy_rec, transcript_path = agy_lookup.get(session_id)
         if agy_rec is not None:
-            tokens = {
-                "in": int(agy_rec.get("in", 0) or 0),
-                "cache": int(agy_rec.get("cache", 0) or 0),
-                "out": int(agy_rec.get("out", 0) or 0),
-            }
-            if cost_usd is None and rate_table is not None:
-                est = rate_table.estimate_cost_usd(
-                    agy_rec.get("model") or model,
-                    tokens,
-                )
-                if est is not None:
-                    cost_usd = est
-                    cost_estimated = True
+            trace = list(agy_rec.get("trace") or [])
+            if agy_rec.get("in") or agy_rec.get("cache") or agy_rec.get("out"):
+                tokens = {
+                    "in": int(agy_rec.get("in", 0) or 0),
+                    "cache": int(agy_rec.get("cache", 0) or 0),
+                    "out": int(agy_rec.get("out", 0) or 0),
+                }
+                cache_read = tokens["cache"]
+                if cost_usd is None and rate_table is not None:
+                    est = rate_table.estimate_cost_usd(
+                        agy_rec.get("model") or model,
+                        tokens,
+                    )
+                    if est is not None:
+                        cost_usd = est
+                        cost_estimated = True
 
-    return tokens, cost_usd, cost_estimated, transcript_path
+    return tokens, cost_usd, cost_estimated, transcript_path, cache_read, trace
 
 
 def _extract_referenced_files(
@@ -717,7 +734,7 @@ def _parse_committee_dir(
 
         agent_lab = normalize_lab(model, member.get("lab") or cli)
         reported_cost = out_data.get("cost_usd") if out_data else None
-        tokens, cost_usd, cost_estimated, tr_path = _resolve_usage_and_cost(
+        tokens, cost_usd, cost_estimated, tr_path, cache_read, trace = _resolve_usage_and_cost(
             session_id,
             model,
             cli=cli,
@@ -805,6 +822,7 @@ def _parse_committee_dir(
             tokens=tokens,
             cost_usd=cost_usd,
             errors=errors,
+            trace=trace,
             last=last_text,
             result=response if isinstance(response, str) else None,
             weight=weight,
@@ -813,6 +831,8 @@ def _parse_committee_dir(
             output_ids=agent_output_ids,
         )
         agent["costEstimated"] = cost_estimated
+        if tokens is not None and cache_read is not None:
+            agent["cacheRead"] = cache_read
         seat_parts = [f"Seat {seat_num}"]
         if role:
             seat_parts.append(str(role))
@@ -1058,7 +1078,7 @@ def _parse_orchestrate_dir(
 
         agent_lab = normalize_lab(model, cli)
         reported_cost = out_data.get("cost_usd") if out_data else None
-        tokens, cost_usd, cost_estimated, tr_path = _resolve_usage_and_cost(
+        tokens, cost_usd, cost_estimated, tr_path, cache_read, trace = _resolve_usage_and_cost(
             session_id,
             model,
             cli=cli,
@@ -1134,12 +1154,15 @@ def _parse_orchestrate_dir(
             tokens=tokens,
             cost_usd=cost_usd,
             errors=errors,
+            trace=trace,
             last=_clean_excerpt(response) or ("Running task…" if state == "running" else None),
             result=response if isinstance(response, str) else None,
             links=links,
             output_ids=agent_output_ids,
         )
         agent["costEstimated"] = cost_estimated
+        if tokens is not None and cache_read is not None:
+            agent["cacheRead"] = cache_read
         plan_task_str = (
             f"{title} — {goal}"
             if (goal and title and str(goal).strip() not in title)
@@ -1270,7 +1293,7 @@ def _parse_sessions_ledger(
             ts = rec["_parsed_ts"]
 
             agent_lab = normalize_lab(model, cli)
-            tokens, cost_usd, cost_estimated, _tr_path = _resolve_usage_and_cost(
+            tokens, cost_usd, cost_estimated, _tr_path, cache_read, trace = _resolve_usage_and_cost(
                 sid,
                 model,
                 cli=cli,
@@ -1298,9 +1321,12 @@ def _parse_sessions_ledger(
                 ended_at=to_iso_utc(ts),
                 tokens=tokens,
                 cost_usd=cost_usd,
+                trace=trace,
                 links=links,
             )
             agent["costEstimated"] = cost_estimated
+            if tokens is not None and cache_read is not None:
+                agent["cacheRead"] = cache_read
             hint_parts = [
                 p
                 for p in (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -62,6 +63,13 @@ _LIVE_RUN_STATUSES = ("queued", "preparing", "starting", "running", "waiting")
 _MAX_TRACE_ITEMS = 30
 _MAX_FILE_OUTPUTS_PER_AGENT = 12
 _RESULT_SNIPPET_CHARS = 400
+_TURN_ITEM_TOOL_LABELS = {
+    "command_execution": "command",
+    "dynamic_tool": "tool",
+    "file_change": "file_change",
+    "file_search": "file_search",
+    "web_search": "web_search",
+}
 
 # Patterns to detect file paths referenced inside subagent result markdown/text.
 _MD_FILE_LINK_RE = re.compile(r"file://(/[^)\s\"'`>]+)")
@@ -248,7 +256,7 @@ def _parse_agy_transcript(path: Path) -> dict[str, Any] | None:
     cache_tok = 0
     out_tok = 0
     model: str | None = None
-    trace: list[list[Any]] = []
+    tool_counts: Counter[str] = Counter()
     last_activity: str | None = None
 
     try:
@@ -272,15 +280,16 @@ def _parse_agy_transcript(path: Path) -> dict[str, Any] | None:
                 if isinstance(tcs, list):
                     for tc in tcs:
                         if isinstance(tc, dict):
+                            tname = str(tc.get("name") or "").strip()
+                            if tname:
+                                tool_counts[tname] += 1
                             item = _summarize_tool_call(tc)
                             if item is not None:
-                                trace.append(item)
                                 last_activity = f"{item[0]}: {item[1]}" if len(item) > 1 else str(item[0])
     except OSError:
         return None
 
-    if len(trace) > _MAX_TRACE_ITEMS:
-        trace = trace[-_MAX_TRACE_ITEMS:]
+    trace = [[name, count] for name, count in tool_counts.most_common()]
 
     has_tokens = (in_tok + cache_tok + out_tok) > 0
     parsed = {
@@ -465,8 +474,9 @@ def _resolve_telemetry(
     str | None,
     Path | None,
     bool,
+    int | None,
 ]:
-    """Resolve real tokens, USD cost, trace, last activity, model, transcript path, and cost_estimated."""
+    """Resolve real tokens, USD cost, trace, last activity, model, transcript path, cost_estimated, and cache_read."""
     tokens: dict[str, int] | None = None
     cost_usd: float | None = None
     trace: list[list[Any]] = []
@@ -474,9 +484,10 @@ def _resolve_telemetry(
     resolved_model = model
     transcript_path: Path | None = None
     cost_estimated = True
+    cache_read: int | None = None
 
     if not native_id:
-        return tokens, cost_usd, trace, last_act, resolved_model, transcript_path, cost_estimated
+        return tokens, cost_usd, trace, last_act, resolved_model, transcript_path, cost_estimated, cache_read
 
     prov_lower = (provider or "").strip().lower()
 
@@ -494,6 +505,7 @@ def _resolve_telemetry(
                 if not resolved_model and tr_model:
                     resolved_model = tr_model
                 if tokens is not None:
+                    cache_read = tokens["cache"]
                     cost_usd = _estimate_cost_fast(rate_table, resolved_model, tokens)
                     if cost_usd is None and tr_model and tr_model != resolved_model:
                         cost_usd = _estimate_cost_fast(rate_table, tr_model, tokens)
@@ -505,6 +517,8 @@ def _resolve_telemetry(
             parsed_g = _parse_grok_usage(g_path)
             if parsed_g is not None:
                 tokens = parsed_g["tokens"]
+                if tokens is not None:
+                    cache_read = parsed_g["cacheRead"]
                 cost_usd = parsed_g["costUsd"]
                 if cost_usd is not None:
                     cost_estimated = False
@@ -528,6 +542,7 @@ def _resolve_telemetry(
                 "cache": rec["cache"],
                 "out": rec["out"],
             }
+            cache_read = rec.get("cacheRead")
             if not resolved_model and rec.get("model"):
                 resolved_model = rec["model"]
             cost_usd = rec.get("costUsd")
@@ -542,7 +557,7 @@ def _resolve_telemetry(
                     cache_write=rec.get("cacheWrite"),
                 )
 
-    return tokens, cost_usd, trace, last_act, resolved_model, transcript_path, cost_estimated
+    return tokens, cost_usd, trace, last_act, resolved_model, transcript_path, cost_estimated, cache_read
 
 
 def _t3_thread_link(env_id: str | None, thread_id: str | None) -> dict[str, Any] | None:
@@ -1012,6 +1027,35 @@ def discover_t3_flows(
             _SUBAGENT_RESULT_CACHE[ckey] = val
             if val is not None:
                 full_results[sid] = val
+
+        # Fetch tool call counts per thread via covering index (type, status) without reading payload_json.
+        turn_item_trace_by_tid: dict[str, list[list[Any]]] = {}
+        if selected_thread_ids:
+            try:
+                tids = list(selected_thread_ids)
+                raw_counts: dict[str, list[list[Any]]] = {}
+                for i in range(0, len(tids), 400):
+                    chunk = tids[i : i + 400]
+                    ph = ",".join("?" * len(chunk))
+                    for row in conn.execute(
+                        f"""
+                        SELECT thread_id, type, COUNT(*) AS cnt
+                        FROM orchestration_v2_projection_turn_items
+                        WHERE thread_id IN ({ph})
+                          AND type IN ('command_execution', 'file_change', 'file_search', 'web_search', 'dynamic_tool')
+                        GROUP BY thread_id, type
+                        """,
+                        chunk,
+                    ):
+                        label = _TURN_ITEM_TOOL_LABELS.get(row["type"])
+                        cnt = int(row["cnt"] or 0)
+                        if label and cnt > 0:
+                            raw_counts.setdefault(row["thread_id"], []).append([label, cnt])
+                for tid, items in raw_counts.items():
+                    items.sort(key=lambda x: (-x[1], x[0]))
+                    turn_item_trace_by_tid[tid] = items
+            except sqlite3.Error:
+                turn_item_trace_by_tid = {}
     except sqlite3.Error:
         return []
     finally:
@@ -1069,7 +1113,7 @@ def discover_t3_flows(
         if not root_nid and root_info.get("active_provider_thread_id"):
             root_nid, root_drv = pt_native_by_ptid.get(root_info["active_provider_thread_id"], (None, None))
 
-        root_tokens, root_cost, root_trace, root_last, root_res_model, root_tr_path, root_cost_est = _resolve_telemetry(
+        root_tokens, root_cost, root_trace, root_last, root_res_model, root_tr_path, root_cost_est, root_cache_read = _resolve_telemetry(
             provider=root_drv or root_provider,
             model=root_model,
             native_id=root_nid,
@@ -1078,9 +1122,14 @@ def discover_t3_flows(
             brain_map=brain_map,
             grok_map=grok_map,
         )
+        if not root_trace:
+            root_trace = turn_item_trace_by_tid.get(root_tid, [])
 
         seen_native_ids: set[str] = set()
+        seen_trace_native_ids: set[str] = set()
         seen_usage_keys: set[tuple[tuple[tuple[str, int], ...], float | None]] = set()
+        if root_nid and root_trace:
+            seen_trace_native_ids.add(root_nid)
         if root_tokens is not None or root_cost is not None:
             if root_nid:
                 seen_native_ids.add(root_nid)
@@ -1100,7 +1149,7 @@ def discover_t3_flows(
             inid, idrv = pt_native_by_tid.get(itid, (None, None))
             if not inid and tinfo.get("active_provider_thread_id"):
                 inid, idrv = pt_native_by_ptid.get(tinfo["active_provider_thread_id"], (None, None))
-            itok, icost, itrace, ilast, ires_model, itr_path, icost_est = _resolve_telemetry(
+            itok, icost, itrace, ilast, ires_model, itr_path, icost_est, icache_read = _resolve_telemetry(
                 provider=idrv or iprov,
                 model=imodel,
                 native_id=inid,
@@ -1117,6 +1166,15 @@ def discover_t3_flows(
                 seen_native_ids=seen_native_ids,
                 seen_usage_keys=seen_usage_keys,
             )
+            if i_deduped:
+                icache_read = None
+                itrace = []
+            elif inid and inid in seen_trace_native_ids:
+                itrace = []
+            elif not itrace:
+                itrace = turn_item_trace_by_tid.get(itid, [])
+            if inid and itrace:
+                seen_trace_native_ids.add(inid)
             ilinks: list[dict[str, Any]] = []
             tlink = _t3_thread_link(resolved_env_id, itid)
             if tlink:
@@ -1159,6 +1217,8 @@ def discover_t3_flows(
                 output_ids=iout_ids,
             )
             i_agent["costEstimated"] = icost_est
+            if itok is not None and icache_read is not None:
+                i_agent["cacheRead"] = icache_read
             if i_deduped:
                 i_agent["usageDeduped"] = True
                 i_agent["meta"] = {"usageDeduped": True}
@@ -1217,7 +1277,7 @@ def discover_t3_flows(
                 if apt in pt_native_by_ptid:
                     native_id, native_drv = pt_native_by_ptid[apt]
 
-            tokens, cost_usd, trace, last_act, resolved_model, tr_path, cost_est = _resolve_telemetry(
+            tokens, cost_usd, trace, last_act, resolved_model, tr_path, cost_est, cache_read = _resolve_telemetry(
                 provider=native_drv or prov,
                 model=raw_model,
                 native_id=native_id,
@@ -1234,6 +1294,15 @@ def discover_t3_flows(
                 seen_native_ids=seen_native_ids,
                 seen_usage_keys=seen_usage_keys,
             )
+            if usage_deduped:
+                cache_read = None
+                trace = []
+            elif native_id and native_id in seen_trace_native_ids:
+                trace = []
+            elif not trace and ctid and agent_id == ctid:
+                trace = turn_item_trace_by_tid.get(ctid, [])
+            if native_id and trace:
+                seen_trace_native_ids.add(native_id)
 
             links: list[dict[str, Any]] = []
             tlink = _t3_thread_link(resolved_env_id, ctid)
@@ -1313,6 +1382,8 @@ def discover_t3_flows(
                 output_ids=out_ids,
             )
             sub_agent["costEstimated"] = cost_est
+            if tokens is not None and cache_read is not None:
+                sub_agent["cacheRead"] = cache_read
             if usage_deduped:
                 sub_agent["usageDeduped"] = True
                 sub_agent["meta"] = {"usageDeduped": True}
@@ -1398,6 +1469,8 @@ def discover_t3_flows(
             output_ids=root_out_ids,
         )
         root_agent["costEstimated"] = root_cost_est
+        if root_tokens is not None and root_cache_read is not None:
+            root_agent["cacheRead"] = root_cache_read
         root_raw_title = root_info.get("title") or (
             root_title if not _PURE_UUID_RE.match(str(root_title)) else None
         )

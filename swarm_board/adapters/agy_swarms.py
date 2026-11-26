@@ -1028,17 +1028,20 @@ def _build_swarm_flow(
         )
 
         tokens: dict[str, int] | None = None
+        cache_read: int | None = None
         cost_usd: float | None = None
         cost_estimated = True
         if tr is not None:
             t = tr["tokens"]
             if t["in"] or t["cache"] or t["out"]:
                 tokens = t
+                cache_read = t["cache"]
                 cost_usd = rate_table.estimate_cost_usd(model, tokens)
         if tokens is None and m_cid:
             u = usage_index.get(m_cid)
             if u:
                 tokens = {"in": u["in"], "cache": u["cache"], "out": u["out"]}
+                cache_read = u.get("cacheRead")
                 cost_usd = u.get("costUsd")
                 if cost_usd is not None:
                     cost_estimated = False
@@ -1139,6 +1142,8 @@ def _build_swarm_flow(
         if role in HELPER_ROLES:
             agent["isHelper"] = True
         agent["costEstimated"] = cost_estimated
+        if tokens is not None and cache_read is not None:
+            agent["cacheRead"] = cache_read
         plan_task = plan_tasks.get(m_name) or (
             _bound_hint(goal_str, 400) if role == "coordinator" else None
         )

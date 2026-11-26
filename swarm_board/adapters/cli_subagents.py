@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -34,7 +35,91 @@ TAIL_READ_BYTES = 24_576
 _DEFAULT_RATE_TABLE = RateTable()
 _DEFAULT_USAGE_INDEX = UsageIndex()
 _CLAUDE_HEAD_CACHE: dict[str, tuple[int, int, str | None]] = {}
+_GROK_EVENTS_TRACE_CACHE: dict[str, tuple[int, int, list[list[Any]]]] = {}
+_CLAUDE_TRACE_CACHE: dict[str, tuple[int, int, list[list[Any]]]] = {}
 _TRUNCATED_CONTENT_RE = re.compile(r'"content"\s*:\s*"((?:\\.|[^"\\]){1,1024})')
+
+
+def _parse_grok_events_trace(path: Path) -> list[list[Any]]:
+    """Parse tool call counts from a Grok session events.jsonl, cached by (mtime_ns, size)."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    cached = _GROK_EVENTS_TRACE_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+
+    counts: Counter[str] = Counter()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"tool_started"' not in line and '"mcp_tool_call_started"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") not in ("tool_started", "mcp_tool_call_started"):
+                    continue
+                tname = obj.get("tool_name")
+                if isinstance(tname, str) and tname.strip():
+                    counts[tname.strip()] += 1
+    except OSError:
+        return []
+
+    trace = [[name, count] for name, count in counts.most_common()]
+    if len(_GROK_EVENTS_TRACE_CACHE) > 512:
+        _GROK_EVENTS_TRACE_CACHE.clear()
+    _GROK_EVENTS_TRACE_CACHE[key] = (st.st_mtime_ns, st.st_size, trace)
+    return trace
+
+
+def _parse_claude_subagent_trace(path: Path) -> list[list[Any]]:
+    """Parse tool_use counts from a Claude subagent JSONL, cached by (mtime_ns, size)."""
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    cached = _CLAUDE_TRACE_CACHE.get(key)
+    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+
+    counts: Counter[str] = Counter()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"tool_use"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                msg = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if (
+                            isinstance(part, dict)
+                            and part.get("type") == "tool_use"
+                            and isinstance(part.get("name"), str)
+                            and part["name"].strip()
+                        ):
+                            counts[part["name"].strip()] += 1
+    except OSError:
+        return []
+
+    trace = [[name, count] for name, count in counts.most_common()]
+    if len(_CLAUDE_TRACE_CACHE) > 512:
+        _CLAUDE_TRACE_CACHE.clear()
+    _CLAUDE_TRACE_CACHE[key] = (st.st_mtime_ns, st.st_size, trace)
+    return trace
 
 
 def _bound_hint(text: Any, limit: int = 400) -> str | None:
@@ -250,7 +335,7 @@ def _parse_grok_session(
     out_tok = int(usage_sess.get("outputTokens") or 0)
     cache_read = int(usage_sess.get("cachedReadTokens") or 0)
     cache_write = int(usage_sess.get("cacheCreationTokens") or 0)
-    non_cached_in = max(0, in_raw - cache_read)
+    non_cached_in = max(0, in_raw - cache_read - cache_write)
 
     tokens: dict[str, int] | None = None
     if in_raw or out_tok or cache_read or cache_write:
@@ -328,8 +413,10 @@ def _parse_grok_session(
         "updated_ts": updated_ts,
         "state": state,
         "tokens": tokens,
+        "cache_read": cache_read,
         "cost_usd": cost_usd,
         "model_calls": usage_sess.get("modelCalls"),
+        "trace": _parse_grok_events_trace(events_path) if events_path.is_file() else [],
         "last": _truncate(summary.get("last_turn_summary") or last_assistant, 160),
         "result": _truncate(last_assistant or summary.get("last_turn_summary"), 400),
         "chat_path": str(chat_path) if chat_path.is_file() else None,
@@ -445,11 +532,14 @@ def _discover_grok_flows(
                     dur_s=dur_s,
                     tokens=s["tokens"],
                     cost_usd=s["cost_usd"],
+                    trace=s.get("trace") or [],
                     last=s["last"],
                     result=s["result"],
                     links=links,
                     output_ids=out_ids,
                 )
+                if s["tokens"] is not None:
+                    agent["cacheRead"] = s["cache_read"]
                 raw_title = s["generated_title"] or (
                     _bound_hint(s["title"], 400)
                     if s["title"] != s["session_summary"]
@@ -636,6 +726,8 @@ def _discover_codex_flows(
                 last=_truncate(r.get("preview") or r.get("first_user_message"), 160),
                 links=links,
             )
+            if u_rec and tokens is not None and u_rec.get("cacheRead") is not None:
+                agent["cacheRead"] = u_rec["cacheRead"]
             agent["_labelHint"] = {
                 "prompt": _bound_hint(
                     r.get("first_user_message") or r.get("preview"),
@@ -786,6 +878,8 @@ def _discover_claude_flows(
                     last=last_task,
                     links=links,
                 )
+                if u_rec and tokens is not None and u_rec.get("cacheRead") is not None:
+                    agent["cacheRead"] = u_rec["cacheRead"]
                 agent["_labelHint"] = {
                     "prompt": _bound_hint(raw_task_desc, 360),
                     "slug": _bound_hint(m.get("agentType"), 400),
@@ -839,7 +933,7 @@ def _discover_claude_flows(
                 tail = _read_tail_jsonl(sf, max_lines=30)
                 sid = sf.stem
                 model = "claude"
-                in_tok = cache_tok = out_tok = 0
+                in_tok = cache_tok = cache_read_tok = out_tok = 0
                 last_msg: str | None = None
                 first_ts: float | None = None
                 last_ts: float | None = None
@@ -860,7 +954,9 @@ def _discover_claude_flows(
                         model = msg["model"]
                     usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
                     in_tok += int(usage.get("input_tokens") or 0)
-                    cache_tok += int(usage.get("cache_read_input_tokens") or 0) + int(
+                    cr_val = int(usage.get("cache_read_input_tokens") or 0)
+                    cache_read_tok += cr_val
+                    cache_tok += cr_val + int(
                         usage.get("cache_creation_input_tokens") or 0
                     )
                     out_tok += int(usage.get("output_tokens") or 0)
@@ -883,12 +979,15 @@ def _discover_claude_flows(
 
                 u_rec = usage_index.get(sid)
                 tokens: dict[str, int] | None = None
+                cache_read_val: int | None = None
                 cost_usd: float | None = None
                 if u_rec:
                     tokens = {"in": u_rec["in"], "cache": u_rec["cache"], "out": u_rec["out"]}
+                    cache_read_val = u_rec.get("cacheRead")
                     cost_usd = u_rec.get("costUsd")
                 elif in_tok or cache_tok or out_tok:
                     tokens = {"in": in_tok, "cache": cache_tok, "out": out_tok}
+                    cache_read_val = cache_read_tok
                 if cost_usd is None and tokens is not None:
                     cost_usd = rate_table.estimate_cost_usd(model, tokens)
 
@@ -927,10 +1026,13 @@ def _discover_claude_flows(
                     dur_s=compute_dur_s(s_iso, e_iso, is_running=False, now_ts=now_ts),
                     tokens=tokens,
                     cost_usd=cost_usd,
+                    trace=_parse_claude_subagent_trace(sf),
                     last=_truncate(last_msg, 160),
                     links=links,
                     output_ids=[out_id],
                 )
+                if tokens is not None and cache_read_val is not None:
+                    agent["cacheRead"] = cache_read_val
                 agent["_labelHint"] = {
                     "prompt": head_prompt,
                     "slug": _bound_hint(sf.stem, 400),

@@ -622,8 +622,8 @@ class StatsCrossAdapterAndRangeTests(unittest.TestCase):
             st_all = reg.get_stats(scope="all", rng="all")
             self.assertAlmostEqual(st_all["costUsd"], 20.0, places=2)
             self.assertEqual(st_all["agentsCount"], 4)
-            self.assertEqual(len(st_all["topAgents"][0]), 14)
-            self.assertEqual(st_all["topAgents"][0][12:], ["t3:range-test", "a-old"])
+            self.assertEqual(len(st_all["topAgents"][0]), 15)
+            self.assertEqual(st_all["topAgents"][0][12:], ["t3:range-test", "a-old", 0])
 
             # rng = "7d" -> excludes a-old ($10), keeps $5 + $4 + $1 = $10.00
             st_7d = reg.get_stats(scope="all", rng="7d")
@@ -670,6 +670,186 @@ class StatsCrossAdapterAndRangeTests(unittest.TestCase):
                 places=2,
             )
 
+    def test_cache_hit_pct_and_tool_calls_aggregation_and_dedup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hi_ts = int(datetime(2026, 11, 25, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+            now_ts = float(hi_ts + 1800)
+            w24_start = float(hi_ts - 23 * 3600)
+            reg = self._build_registry(root, now_ts)
+
+            shared_sid = "22222222-2222-2222-2222-222222222222"
+            flows = [
+                {
+                    "id": "t3:hit-tools",
+                    "title": "Cache Hit & Tools",
+                    "project": "p",
+                    "projectRoot": None,
+                    "harness": "t3",
+                    "kind": "flat",
+                    "startedAt": to_iso_utc(w24_start - 3600),
+                    "updatedAt": to_iso_utc(hi_ts),
+                    "goal": None,
+                    "decision": None,
+                    "workstreams": [],
+                    "posts": [],
+                    "outputs": [],
+                    "links": [],
+                    "agents": [
+                        {
+                            "id": "claude-1",
+                            "parent": None,
+                            "name": "Claude Worker",
+                            "role": "worker",
+                            "lab": "anthropic",
+                            "model": "claude-opus-5",
+                            "state": "done",
+                            "startedAt": to_iso_utc(hi_ts - 1800),
+                            "endedAt": to_iso_utc(hi_ts),
+                            "durS": 1800,
+                            # cacheRead=800, cache=1000 (800 read + 200 write), in=40 -> 800/1040 = 76.9%
+                            "tokens": {"in": 40, "cache": 1000, "out": 50},
+                            "cacheRead": 800,
+                            "costUsd": 1.0,
+                            "costEstimated": True,
+                            "trace": [["command", 12], ["tool", 8]],
+                            "links": [{"kind": "session", "id": shared_sid}],
+                            "outputIds": [],
+                        },
+                        {
+                            # Duplicate node:* row in same flow: usage & tool calls must be suppressed
+                            "id": "node:dup-claude",
+                            "parent": "claude-1",
+                            "name": "Claude Continuation",
+                            "role": "worker",
+                            "lab": "anthropic",
+                            "model": "claude-opus-5",
+                            "state": "done",
+                            "startedAt": to_iso_utc(hi_ts - 900),
+                            "endedAt": to_iso_utc(hi_ts),
+                            "durS": 900,
+                            "tokens": {"in": 40, "cache": 1000, "out": 50},
+                            "cacheRead": 800,
+                            "costUsd": 1.0,
+                            "costEstimated": True,
+                            "trace": [["command", 12], ["tool", 8]],
+                            "links": [{"kind": "session", "id": shared_sid}],
+                            "outputIds": [],
+                        },
+                        {
+                            # Straddling AGY agent without explicit cacheRead -> falls back to cache
+                            # 50% in 24h window -> 50% of 100 calls = 50 calls
+                            "id": "agy-straddle",
+                            "parent": None,
+                            "name": "AGY Straddle",
+                            "role": "worker",
+                            "lab": "google",
+                            "model": "gemini-4-neon",
+                            "state": "done",
+                            "startedAt": to_iso_utc(w24_start - 3600),
+                            "endedAt": to_iso_utc(w24_start + 3600),
+                            "durS": 7200,
+                            "tokens": {"in": 200, "cache": 800, "out": 100},
+                            "costUsd": 2.0,
+                            "costEstimated": True,
+                            "trace": [["read_file", 60], ["edit_file", 40]],
+                            "links": [],
+                            "outputIds": [],
+                        },
+                        {
+                            # Zero-token/cost agent with tool calls -> included in topAgents, cacheHitPct is None
+                            "id": "tools-only",
+                            "parent": None,
+                            "name": "Tools Only",
+                            "role": "worker",
+                            "lab": "xai",
+                            "model": "grok-4.7-build",
+                            "state": "done",
+                            "startedAt": to_iso_utc(hi_ts - 600),
+                            "endedAt": to_iso_utc(hi_ts),
+                            "durS": 600,
+                            "tokens": None,
+                            "costUsd": None,
+                            "trace": [["list_dir", 5]],
+                            "links": [],
+                            "outputIds": [],
+                        },
+                    ],
+                },
+                {
+                    # Cross-adapter flow sharing shared_sid -> suppressed in scope='all'
+                    "id": "claude:dup-flow",
+                    "title": "Dup Flow",
+                    "project": "p",
+                    "projectRoot": None,
+                    "harness": "claude",
+                    "kind": "flat",
+                    "startedAt": to_iso_utc(hi_ts - 1800),
+                    "updatedAt": to_iso_utc(hi_ts),
+                    "goal": None,
+                    "decision": None,
+                    "workstreams": [],
+                    "posts": [],
+                    "outputs": [],
+                    "links": [],
+                    "agents": [
+                        {
+                            "id": "claude-dup-agent",
+                            "parent": None,
+                            "name": "Claude Dup",
+                            "role": "worker",
+                            "lab": "anthropic",
+                            "model": "claude-opus-5",
+                            "state": "done",
+                            "startedAt": to_iso_utc(hi_ts - 1800),
+                            "endedAt": to_iso_utc(hi_ts),
+                            "durS": 1800,
+                            "tokens": {"in": 40, "cache": 1000, "out": 50},
+                            "cacheRead": 800,
+                            "costUsd": 1.0,
+                            "costEstimated": True,
+                            "trace": [["command", 12], ["tool", 8]],
+                            "links": [{"kind": "session", "id": shared_sid}],
+                            "outputIds": [],
+                        }
+                    ],
+                },
+            ]
+            with reg._lock:
+                reg._cached_flows = flows
+                reg._flow_by_id = {f["id"]: f for f in flows}
+                reg._has_snapshot = True
+                reg._cached_at = 1e12
+
+            st_all = reg.get_stats(scope="all", rng="all")
+            self.assertEqual(st_all["dupRows"], 2)
+            self.assertEqual(st_all["toolCalls"], 125)  # 20 + 100 + 5 (no dup double count)
+            # Total input across non-dup models: (40+1000) + (200+800) = 2040; cacheRead = 800 + 800 = 1600 -> 78.4%
+            self.assertAlmostEqual(st_all["cacheHitPct"], 78.4, places=1)
+
+            by_m = {m["model"]: m for m in st_all["byModel"]}
+            self.assertAlmostEqual(by_m["claude-opus-5"]["cacheHitPct"], 76.9, places=1)
+            self.assertEqual(by_m["claude-opus-5"]["cacheRead"], 800)
+            self.assertEqual(by_m["claude-opus-5"]["toolCalls"], 20)
+            self.assertAlmostEqual(by_m["gemini-4-neon"]["cacheHitPct"], 80.0, places=1)
+            self.assertEqual(by_m["gemini-4-neon"]["toolCalls"], 100)
+            self.assertIsNone(by_m["grok-4.7-build"]["cacheHitPct"])
+            self.assertEqual(by_m["grok-4.7-build"]["toolCalls"], 5)
+
+            top_by_id = {row[13]: row for row in st_all["topAgents"]}
+            self.assertEqual(top_by_id["claude-1"][14], 20)
+            self.assertNotIn("node:dup-claude", top_by_id)
+            self.assertNotIn("claude-dup-agent", top_by_id)
+            self.assertEqual(top_by_id["agy-straddle"][14], 100)
+            self.assertEqual(top_by_id["tools-only"][14], 5)
+
+            # 24h range pro-rates agy-straddle to 50% (50 calls)
+            st_24h = reg.get_stats(scope="all", rng="24h")
+            self.assertEqual(st_24h["toolCalls"], 75)  # 20 + 50 + 5
+            by_m_24 = {m["model"]: m for m in st_24h["byModel"]}
+            self.assertEqual(by_m_24["gemini-4-neon"]["toolCalls"], 50)
+            self.assertAlmostEqual(by_m_24["gemini-4-neon"]["cacheHitPct"], 80.0, places=1)
+
 
 class AgyCliTranscriptJoinTests(unittest.TestCase):
     def test_joins_agy_transcripts_across_committee_orchestrate_and_delegate(self) -> None:
@@ -702,6 +882,7 @@ class AgyCliTranscriptJoinTests(unittest.TestCase):
                             "input_tokens": 100_000,
                             "cache_read_tokens": 200_000,
                             "output_tokens": 10_000,
+                            "tool_calls": [{"name": "read_file"}, {"name": "edit_file"}],
                         }
                     ],
                 )
@@ -810,16 +991,22 @@ class AgyCliTranscriptJoinTests(unittest.TestCase):
             self.assertFalse(c_agents["committee-2"]["costEstimated"])
 
             self.assertEqual(c_agents["committee-3"]["tokens"], expected_tok)
+            self.assertEqual(c_agents["committee-3"]["cacheRead"], 200_000)
+            self.assertEqual(c_agents["committee-3"]["trace"], [["read_file", 1], ["edit_file", 1]])
             self.assertAlmostEqual(c_agents["committee-3"]["costUsd"], expected_est_cost, places=4)
             self.assertTrue(c_agents["committee-3"]["costEstimated"])
 
             orch = next(f for f in flows if f["id"] == "orchestrate:agy-orch")
             self.assertEqual(orch["agents"][0]["tokens"], expected_tok)
+            self.assertEqual(orch["agents"][0]["cacheRead"], 200_000)
+            self.assertEqual(orch["agents"][0]["trace"], [["read_file", 1], ["edit_file", 1]])
             self.assertAlmostEqual(orch["agents"][0]["costUsd"], expected_est_cost, places=4)
 
             del_flow = next(f for f in flows if f["harness"] == "delegate")
             agy_del = next(a for a in del_flow["agents"] if a["lab"] == "google")
             self.assertEqual(agy_del["tokens"], expected_tok)
+            self.assertEqual(agy_del["cacheRead"], 200_000)
+            self.assertEqual(agy_del["trace"], [["read_file", 1], ["edit_file", 1]])
             self.assertAlmostEqual(agy_del["costUsd"], expected_est_cost, places=4)
 
 

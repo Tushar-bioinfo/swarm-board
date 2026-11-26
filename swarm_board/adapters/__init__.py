@@ -228,6 +228,20 @@ def _canonical_session_ids(agent: dict[str, Any]) -> list[str]:
     return out
 
 
+def _agent_tool_calls(agent: dict[str, Any]) -> int:
+    """Sum numeric tool-call counts from an agent's trace."""
+    total = 0
+    for item in agent.get("trace") or ():
+        if (
+            isinstance(item, (list, tuple))
+            and len(item) >= 2
+            and isinstance(item[1], (int, float))
+            and not isinstance(item[1], bool)
+        ):
+            total += max(0, int(item[1]))
+    return total
+
+
 def enrich_flow_telemetry(
     flow: dict[str, Any],
     rate_table: RateTable | None = None,
@@ -802,6 +816,16 @@ class BoardRegistry:
                 in_raw = int(tok_eff_src.get("in", 0) or 0) if tok_eff_src else 0
                 cache_raw = int(tok_eff_src.get("cache", 0) or 0) if tok_eff_src else 0
                 out_raw = int(tok_eff_src.get("out", 0) or 0) if tok_eff_src else 0
+                if is_dup:
+                    cache_read_raw = 0
+                    calls_raw = 0
+                else:
+                    cr_val = a.get("cacheRead")
+                    if tok_eff_src and isinstance(cr_val, (int, float)) and not isinstance(cr_val, bool):
+                        cache_read_raw = min(cache_raw, max(0, int(cr_val)))
+                    else:
+                        cache_read_raw = cache_raw
+                    calls_raw = _agent_tool_calls(a)
                 dur_raw = float(a.get("durS") or 0.0)
 
                 if sp is not None:
@@ -828,7 +852,9 @@ class BoardRegistry:
                 eff_dur = dur_raw * frac
                 eff_in = in_raw * frac
                 eff_cache = cache_raw * frac
+                eff_cache_read = cache_read_raw * frac
                 eff_out = out_raw * frac
+                eff_calls = calls_raw * frac
                 eff_cost = (cost_eff_src * frac) if cost_eff_src is not None else None
                 eff_sav = (float(sav) * frac) if sav is not None else 0.0
 
@@ -842,7 +868,9 @@ class BoardRegistry:
                         "durS": 0.0,
                         "in": 0.0,
                         "cache": 0.0,
+                        "cacheRead": 0.0,
                         "out": 0.0,
+                        "toolCalls": 0.0,
                         "costUsd": 0.0,
                         "costEstimated": True,
                         "cacheSav": 0.0,
@@ -855,7 +883,9 @@ class BoardRegistry:
                 m_rec["durS"] += eff_dur
                 m_rec["in"] += eff_in
                 m_rec["cache"] += eff_cache
+                m_rec["cacheRead"] += eff_cache_read
                 m_rec["out"] += eff_out
+                m_rec["toolCalls"] += eff_calls
                 if eff_cost is not None:
                     m_rec["costUsd"] += eff_cost
                     m_rec["rated"] += 1
@@ -869,7 +899,11 @@ class BoardRegistry:
                     for k_split in ("cached", "uncached", "output"):
                         m_rec["costSplit"][k_split] += cost_split[k_split] * frac
 
-                if (eff_cost is not None and eff_cost > 0.0) or (eff_in + eff_cache + eff_out) > 0.0:
+                if (
+                    (eff_cost is not None and eff_cost > 0.0)
+                    or (eff_in + eff_cache + eff_out) > 0.0
+                    or eff_calls > 0.0
+                ):
                     disp_name = (
                         "root"
                         if a.get("role") == "root"
@@ -891,6 +925,7 @@ class BoardRegistry:
                             round(sp[1]) if sp is not None else None,
                             f_id,
                             a_id,
+                            round(eff_calls),
                         ]
                     )
 
@@ -904,7 +939,11 @@ class BoardRegistry:
             m["durS"] = round(m["durS"])
             m["in"] = round(m["in"])
             m["cache"] = round(m["cache"])
+            m["cacheRead"] = round(m["cacheRead"])
             m["out"] = round(m["out"])
+            m["toolCalls"] = round(m["toolCalls"])
+            in_total = m["in"] + m["cache"]
+            m["cacheHitPct"] = round(100.0 * m["cacheRead"] / in_total, 1) if in_total > 0 else None
             m["costUsd"] = round(m["costUsd"], 4)
             m["cacheSav"] = round(m["cacheSav"], 4)
             m["costSplit"] = {k: round(v, 4) for k, v in m["costSplit"].items()}
@@ -920,6 +959,8 @@ class BoardRegistry:
             )
         )
         rated_agents = sum(m["rated"] for m in model_rows)
+        total_in_all = sum(m["in"] + m["cache"] for m in model_rows)
+        total_cache_read = sum(m["cacheRead"] for m in model_rows)
         flows_count = (
             len(target_flows)
             if (rng_norm == "all" and lab_norm is None)
@@ -942,6 +983,8 @@ class BoardRegistry:
             "now": round(now),
             "costUsd": round(sum(m["costUsd"] for m in model_rows), 4),
             "cacheSavingsUsd": round(sum(m["cacheSav"] for m in model_rows), 4),
+            "cacheHitPct": round(100.0 * total_cache_read / total_in_all, 1) if total_in_all > 0 else None,
+            "toolCalls": sum(m["toolCalls"] for m in model_rows),
             "costByType": cost_by_type,
             "buckets": _pack_buckets(buckets_acc, step, fixed_t0=packed_t0),
             "byModel": model_rows,

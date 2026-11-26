@@ -601,6 +601,150 @@ class T3DelegationsAdapterTests(unittest.TestCase):
             finally:
                 os.chmod(db_path, 0o644)
 
+    def test_t3_trace_counts_from_agy_transcript_and_turn_items_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proj = root / "proj"
+            proj.mkdir()
+            db_path = root / "statev2.sqlite"
+            _create_mock_t3_db(db_path)
+
+            brain = root / "brain"
+            agy_nid = "aaaaaaaa-1111-2222-3333-444444444444"
+            agy_logs = brain / agy_nid / ".system_generated" / "logs"
+            agy_logs.mkdir(parents=True)
+            # 35 distinct tools + repeated calls -> must keep all counts as ints (never cap at 30)
+            tcs_1 = [{"name": f"tool_{i}", "args": {"Path": "/tmp/a"}} for i in range(35)]
+            tcs_2 = [{"name": "read_file", "args": {"Path": "/tmp/b"}} for _ in range(4)]
+            (agy_logs / "transcript.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "model": "gemini-4-neon",
+                                "input_tokens": 100,
+                                "cache_read_tokens": 400,
+                                "output_tokens": 20,
+                                "tool_calls": tcs_1,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "model": "gemini-4-neon",
+                                "input_tokens": 50,
+                                "cache_read_tokens": 100,
+                                "output_tokens": 10,
+                                "tool_calls": tcs_2,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            con = sqlite3.connect(str(db_path))
+            con.execute(
+                """
+                CREATE TABLE orchestration_v2_projection_turn_items (
+                    turn_item_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    run_id TEXT,
+                    node_id TEXT,
+                    provider_thread_id TEXT,
+                    provider_turn_id TEXT,
+                    parent_item_id TEXT,
+                    ordinal INTEGER NOT NULL,
+                    type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            con.execute("INSERT INTO projection_projects VALUES ('p1', 'Proj', ?)", (str(proj),))
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('root-1', 'p1', 'Root', 'antigravity', 'antigravity', 'pt-root', '2026-11-25T10:00:00Z', '2026-11-25T10:05:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "root-1"}, "modelSelection": {"model": "gemini-4-neon"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('child-claude', 'p1', 'Claude Child', 'claudeAgent', 'claudeAgent', 'pt-cl', '2026-11-25T10:01:00Z', '2026-11-25T10:03:00Z', NULL, NULL, ?)",
+                (json.dumps({"lineage": {"rootThreadId": "root-1", "parentThreadId": "root-1"}, "modelSelection": {"model": "claude-opus-5-5"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt-root', 'root-1', 'antigravity', 'antigravity', '2026-11-25T10:05:00Z', ?)",
+                (json.dumps({"nativeThreadRef": {"nativeId": agy_nid}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_provider_threads VALUES ('pt-cl', 'child-claude', 'claudeAgent', 'claudeAgent', '2026-11-25T10:03:00Z', ?)",
+                (json.dumps({"nativeThreadRef": {"nativeId": "cl-nid-1"}}),),
+            )
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_subagents VALUES ('sub-cl', 'root-1', 'r1', 'n1', 'claudeAgent', 'claudeAgent', 'claudeAgent', 'pt-cl', 'child-claude', 'delegate', 'completed', '2026-11-25T10:01:00Z', '2026-11-25T10:03:00Z', '2026-11-25T10:03:00Z', ?)",
+                (json.dumps({"title": "Claude Task", "role": "worker", "model": "claude-opus-5-5"}),),
+            )
+            # Duplicate continuation node:* pointing at same child-claude thread must NOT get duplicate turn_items trace
+            con.execute(
+                "INSERT INTO orchestration_v2_projection_subagents VALUES ('node:cont-cl', 'root-1', 'r2', 'n2', 'claudeAgent', 'claudeAgent', 'claudeAgent', 'pt-cl', 'child-claude', 'thread-send', 'completed', '2026-11-25T10:04:00Z', '2026-11-25T10:05:00Z', '2026-11-25T10:05:00Z', ?)",
+                (json.dumps({"title": "Claude Cont", "role": "worker", "model": "claude-opus-5-5"}),),
+            )
+
+            # Turn items for child-claude: 3 command_execution, 2 dynamic_tool, plus non-tool items (reasoning, subagent, assistant_message)
+            ti_rows = [
+                ("ti-1", "child-claude", 1, "command_execution"),
+                ("ti-2", "child-claude", 2, "command_execution"),
+                ("ti-3", "child-claude", 3, "command_execution"),
+                ("ti-4", "child-claude", 4, "dynamic_tool"),
+                ("ti-5", "child-claude", 5, "dynamic_tool"),
+                ("ti-6", "child-claude", 6, "subagent"),
+                ("ti-7", "child-claude", 7, "reasoning"),
+                ("ti-8", "child-claude", 8, "assistant_message"),
+            ]
+            for tid_item, th_id, ord_n, typ in ti_rows:
+                con.execute(
+                    "INSERT INTO orchestration_v2_projection_turn_items VALUES (?, ?, 'r1', 'n1', 'pt-cl', 'pturn', NULL, ?, ?, 'completed', '2026-11-25T10:02:00Z', '{}')",
+                    (tid_item, th_id, ord_n, typ),
+                )
+            con.commit()
+            con.close()
+
+            usage_path = root / "usage.json"
+            usage_path.write_text(
+                json.dumps(
+                    {
+                        "files": {
+                            "/tmp/cl.jsonl": {
+                                "cs": {"sessionId": "cl-nid-1"},
+                                "r": [[0, 0, 0, 20, 800, 200, 50, 0, 0, None]],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            flows = discover_t3_flows(
+                db_path=db_path,
+                env_id="env-1",
+                usage_index=UsageIndex(usage_path),
+                brain_roots=[brain],
+                grok_sessions_root=root / "no-grok",
+            )
+            self.assertEqual(len(flows), 1)
+            by_id = {a["id"]: a for a in flows[0]["agents"]}
+            root_trace = by_id["root-1"]["trace"]
+            self.assertEqual(len(root_trace), 36)
+            self.assertTrue(all(isinstance(c, int) for _, c in root_trace))
+            self.assertEqual(sum(c for _, c in root_trace), 39)
+            self.assertEqual(by_id["root-1"]["cacheRead"], 500)
+
+            self.assertEqual(by_id["child-claude"]["trace"], [["command", 3], ["tool", 2]])
+            self.assertEqual(by_id["child-claude"]["cacheRead"], 800)
+            self.assertEqual(by_id["node:cont-cl"]["trace"], [])
+            self.assertNotIn("cacheRead", by_id["node:cont-cl"])
+
 
 class HarnessAndCliAdapterTests(unittest.TestCase):
     def test_committee_orchestrate_and_ledger_dedup(self) -> None:
@@ -728,7 +872,17 @@ class HarnessAndCliAdapterTests(unittest.TestCase):
                 json.dumps({"session": {"inputTokens": 1000, "cachedReadTokens": 200, "outputTokens": 300, "costUsdTicks": 12_340_000_000, "primaryModelId": "grok-4.7-build"}}),
                 encoding="utf-8",
             )
-            (g_sess / "events.jsonl").write_text(json.dumps({"type": "turn_ended", "outcome": "completed"}) + "\n", encoding="utf-8")
+            (g_sess / "events.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "tool_started", "tool_name": "read_file"}),
+                        json.dumps({"type": "mcp_tool_call_started", "tool_name": "list_pages"}),
+                        json.dumps({"type": "turn_ended", "outcome": "completed"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             (g_sess / "chat_history.jsonl").write_text(json.dumps({"type": "assistant", "content": "Finished run", "ts": "2026-11-25T10:02:00Z"}) + "\n", encoding="utf-8")
 
             g_inter = root / "grok" / "demo-proj" / "grok-interactive"
@@ -758,7 +912,19 @@ class HarnessAndCliAdapterTests(unittest.TestCase):
             sub_dir = cl_root / "projects" / "proj-x" / "subagents"
             sub_dir.mkdir(parents=True)
             (sub_dir / "agent-a1.jsonl").write_text(
-                json.dumps({"timestamp": "2026-11-25T10:00:00Z", "cwd": "/tmp/ws", "sessionId": "cl-sub-1", "message": {"model": "claude-haiku-4-5", "content": "Done check", "usage": {"input_tokens": 50, "output_tokens": 10}}}) + "\n",
+                json.dumps(
+                    {
+                        "timestamp": "2026-11-25T10:00:00Z",
+                        "cwd": "/tmp/ws",
+                        "sessionId": "cl-sub-1",
+                        "message": {
+                            "model": "claude-haiku-4-5",
+                            "content": [{"type": "tool_use", "name": "Read"}, {"type": "tool_use", "name": "Bash"}],
+                            "usage": {"input_tokens": 50, "cache_read_input_tokens": 120, "cache_creation_input_tokens": 30, "output_tokens": 10},
+                        },
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
 
@@ -784,7 +950,14 @@ class HarnessAndCliAdapterTests(unittest.TestCase):
             gf = next(f for f in flows if f["harness"] == "grok")
             self.assertEqual(len(gf["agents"]), 1)
             self.assertAlmostEqual(gf["agents"][0]["costUsd"] or 0.0, 1.234, places=3)
+            self.assertEqual(gf["agents"][0]["cacheRead"], 200)
+            self.assertEqual(sum(c for _, c in gf["agents"][0]["trace"]), 2)
             self.assertEqual(len(load_grok_chat_history(g_sess / "chat_history.jsonl")), 1)
+
+            cf = next(f for f in flows if f["id"] == "claude-subagents:proj-x")
+            c_sub = next(a for a in cf["agents"] if a["id"] == "agent-a1")
+            self.assertEqual(c_sub["cacheRead"], 120)
+            self.assertEqual(sum(c for _, c in c_sub["trace"]), 2)
 
 
 class BoardRegistryIntegrationTests(unittest.TestCase):

@@ -104,6 +104,10 @@ class UiLiveTests(unittest.TestCase):
             self.assertIn(ep, self.html, f"Missing live endpoint wiring: {ep}")
         for marker in REQUIRED_MARKERS:
             self.assertIn(marker, self.html, f"Missing expected UI marker: {marker}")
+        self.assertIn("Cache hit", self.html)
+        self.assertIn("Tool calls", self.html)
+        self.assertNotIn("Cache sav.", self.html)
+        self.assertNotIn("Cache savings", self.html)
 
     def test_css_descendant_pseudo_selectors_preserved(self) -> None:
         self.assertIn(".app.stp.stp :is(.fhead,.cols,.filt>.lfold){display:none}", self.html)

@@ -1,5 +1,5 @@
 // ===== views.js: outputs list, side router views, agent telemetry =====
-const trc = (T) => { const m = Math.max(1, ...T.map((t) => t[1])); return `<div class="trace">${T.map((t) => `<span class="mono">${esc(t[0])}</span><i style="width:${(100 * t[1] / m).toFixed(0)}%"></i><span class="num">${t[1]}</span>`).join('')}</div>`; };
+const trc = (T) => { const N = T.filter((t) => typeof t[1] === 'number'), m = Math.max(1, ...N.map((t) => t[1])); return `<div class="trace">${N.map((t) => `<span class="mono">${esc(t[0])}</span><i style="width:${(100 * t[1] / m).toFixed(0)}%"></i><span class="num">${t[1]}</span>`).join('')}</div>`; };
 function postOut(f, p) { return { id: 'post-' + p.id, kind: 'post', title: `Post #${p.id}`, by: p.author, at: p.at, post: p }; }
 function getOut(f, id, view) {
   if (!f || !id) return null;
@@ -79,6 +79,6 @@ function agentHTML(f, a) {
     ${vk('Chat &amp; session', linksBlock(a))}${outs.length ? vk('Outputs', `<ul class="rows">${outs.map((o) => outRow(f, o, false)).join('')}</ul>`) : ''}
     ${E.length ? `<details class="lfold vk" ${S.errs ? 'open' : ''} id="errs"><summary>${LX}${errN(a)} error${errN(a) > 1 ? 's' : ''} · ${esc(String(E[0].kind || '').replace(/_/g, ' '))}</summary>
       <table class="tbl"><tbody>${E.map((e) => `<tr><td class="mono">${esc(e.at || '')}</td><td>${esc(e.kind)} ×${e.count}</td></tr>`).join('')}</tbody></table><div class="md">${E.map((e) => `<pre class="err"><code>${esc(e.msg)}</code></pre>`).join('')}</div></details>` : ''}
-    ${T.length ? `<details class="lfold vk"><summary>${LX}Activity · ${T.reduce((s, t) => s + t[1], 0)} traced calls</summary>${trc(T)}</details>` : ''}
+    ${T.length ? `<details class="lfold vk"><summary>${LX}Activity · ${T.reduce((s, t) => s + (typeof t[1] === 'number' ? t[1] : 0), 0)} traced calls</summary>${trc(T)}</details>` : ''}
     <details class="lfold vk" data-msgs="${esc(tid ? tid.id : '')}"><summary>${LX}Last 5 messages</summary><div class="msgbox">${NTE(tid ? 'Expand to load messages.' : 'No thread or conversation linked for this agent.')}</div></details>`;
 }

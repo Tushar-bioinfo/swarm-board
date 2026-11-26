@@ -21,29 +21,29 @@ function modelBar(V) {
 }
 const tdn = (v, a) => `<td class="num"${a || ''}>${v}</td>`, tkn = (v) => (v ? fmtTok(v) : '—'), du = (s) => (s ? fmtDur(s) : '—');
 const usdg = (g, e) => (g.r || g.cost ? money(g.cost, e) : '—');
-const thd = (h) => `<div class="tws"><table class="tbl"><thead><tr>${h.map((x, i) => `<th${i > 1 ? ' class="num"' : ''}>${x}</th>`).join('')}</tr></thead><tbody>`;
+const thd = (h, n = 1) => `<div class="tws"><table class="tbl"><thead><tr>${h.map((x, i) => `<th${i >= n ? ' class="num"' : ''}>${x}</th>`).join('')}</tr></thead><tbody>`;
 function drill(V) {
   const f = V.f, e = V.est, T = V.T;
   if (S.stab === 'flow' && f) {
-    const tools = {}; (f.agents || []).forEach((a) => (a.trace || []).forEach((t) => (tools[t[0]] = (tools[t[0]] || 0) + t[1])));
+    const tools = {}; (f.agents || []).forEach((a) => (a.trace || []).forEach((t) => { if (typeof t[1] === 'number') tools[t[0]] = (tools[t[0]] || 0) + t[1]; }));
     const TL = Object.entries(tools).sort((p, q) => q[1] - p[1]);
     return `<div class="sdp">${f.goal ? `<p class="prose md">${inl(f.goal)}</p>` : ''}<div class="lnk"><span class="kick">Project root</span><span class="id">${esc(f.projectRoot || '—')}</span></div>
 ${TL.length ? `<div class="kick mt20">Tool calls</div>${trc(TL)}` : ''}</div>`;
   }
   if (S.stab === 'agent') {
-    if (V.all && S.ssort === 'calls') S.ssort = 'spend';
     const sk = { spend: (g) => (g.r ? g.cost : -1), tokens: (g) => g.tok, time: (g) => g.dur, calls: (g) => g.x }[S.ssort] || ((g) => g.cost), b = (v) => `<button class="s" data-ssort="${v}" aria-pressed="${S.ssort === v}">${v[0].toUpperCase() + v.slice(1)}</button>`;
-    return `<div class="seats sso">${['spend', 'tokens', 'time'].concat(V.all ? [] : ['calls']).map(b).join('')}${V.all ? `<span class="meta">Top ${V.agents.length} of ${V.st.agentsCount} agents by spend</span>` : ''}</div>
-${thd(['Agent', 'Model', 'State', 'Time'].concat(V.all ? [] : ['Calls'], ['In · Cached · Out', 'API est.']))}${[...V.agents].sort((p, q) => sk(q.g) - sk(p.g)).map(({ a, id, model, lab, state, flow: fl, flowId, agentId, g }) => {
+    return `<div class="seats sso">${['spend', 'tokens', 'time', 'calls'].map(b).join('')}${V.all ? `<span class="meta">Top ${V.agents.length} of ${V.st.agentsCount} agents by spend</span>` : ''}</div>
+${thd(['Agent', 'Model', 'State', 'Time', 'Calls', 'In · Cached · Out', 'API est.'], 3)}${[...V.agents].sort((p, q) => sk(q.g) - sk(p.g)).map(({ a, id, model, lab, state, flow: fl, flowId, agentId, g }) => {
   const jump = flowId && agentId ? `<button class="tbtn an" data-agent="${esc(agentId)}" data-flowid="${esc(flowId)}" style="color:${labC(lab)}">${esc(id)}</button>` : `<span class="an" style="color:${labC(lab)}">${esc(id)}</span>`;
   return `<tr><td><span class="mn">${sIcon(state, isStop({ state }) ? C.bad : labC(lab))}${jump}</span>${fl && V.all ? `<div class="meta">${esc(fl)}</div>` : ''}</td>
 <td class="mono mist">${esc(model || '—')}</td><td style="color:${isStop({ state }) ? C.bad : C.ink}">${esc(stOf(state))}</td>
-${tdn(du(g.dur), a && state === 'running' && g.dur ? ` data-tick=${g.dur}` : '')}${V.all ? '' : tdn(g.x || '—')}${tdn(g.tok ? `${tkn(g.in)} · ${tkn(g.cache)} · ${tkn(g.out)}` : '—')}${tdn(usdg(g, e))}</tr>`;
+${tdn(du(g.dur), a && state === 'running' && g.dur ? ` data-tick=${g.dur}` : '')}${tdn(cnt(g.x))}${tdn(g.tok ? `${tkn(g.in)} · ${tkn(g.cache)} · ${tkn(g.out)}` : '—')}${tdn(usdg(g, e))}</tr>`;
 }).join('')}
-<tr class="tot"><td>Total${V.all ? ' · range' : ` · ${V.agents.length} agents`}</td><td></td><td></td>${tdn(du(T.dur))}${V.all ? '' : tdn(V.agents.reduce((s, x) => s + x.g.x, 0) || '—')}${tdn(`${tkn(T.in)} · ${tkn(T.cache)} · ${tkn(T.out)}`)}${tdn(T.cost ? money(T.cost, e) : '—')}</tr></tbody></table></div>`;
+<tr class="tot"><td>Total${V.all ? ' · range' : ` · ${V.agents.length} agents`}</td><td></td><td></td>${tdn(du(T.dur))}${tdn(cnt(T.calls))}${tdn(`${tkn(T.in)} · ${tkn(T.cache)} · ${tkn(T.out)}`)}${tdn(T.cost ? money(T.cost, e) : '—')}</tr></tbody></table></div>`;
   }
-  return `${thd(['Model', 'Agents', 'Time', 'Input', 'Cached', 'Output', 'Total', 'API est.', 'Cache sav.'])}${V.models.map((m) => `<tr><td><span class="mn">${emb(m.lab, 'done')}<span style="color:${labC(m.lab)}">${esc(m.m)}</span></span></td>
-${tdn(m.n)}${tdn(du(m.dur))}${tdn(tkn(m.in))}${tdn(tkn(m.cache))}${tdn(tkn(m.out))}${tdn(tkn(m.tok))}${tdn(usdg(m, e || m.e))}${tdn(m.sav > 0 ? money(m.sav, 1) : '—')}</tr>`).join('')}</tbody></table></div>`;
+  return `${thd(['Model', 'Agents', 'Time', 'Calls', 'Input', 'Cached', 'Output', 'Total', 'API est.', 'Cache hit'], 1)}${V.models.map((m) => `<tr><td><span class="mn">${emb(m.lab, 'done')}<span style="color:${labC(m.lab)}">${esc(m.m)}</span></span></td>
+${tdn(m.n)}${tdn(du(m.dur))}${tdn(cnt(m.calls))}${tdn(tkn(m.in))}${tdn(tkn(m.cache))}${tdn(tkn(m.out))}${tdn(tkn(m.tok))}${tdn(usdg(m, e || m.e))}${tdn(pct(m.hit))}</tr>`).join('')}
+<tr class="tot"><td>Total</td>${tdn(V.models.reduce((s, m) => s + m.n, 0))}${tdn(du(T.dur))}${tdn(cnt(T.calls))}${tdn(tkn(T.in))}${tdn(tkn(T.cache))}${tdn(tkn(T.out))}${tdn(tkn(T.tok))}${tdn(T.cost ? money(T.cost, e) : '—')}${tdn(pct(T.hit))}</tr></tbody></table></div>`;
 }
 function niceMax(v) { const p = Math.pow(10, Math.floor(Math.log10(v))); return [1, 2, 2.5, 5, 10].map((x) => x * p).find((x) => x >= v * 1.04) || 10 * p; }
 function mono(P) {
